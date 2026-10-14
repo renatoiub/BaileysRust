@@ -38,7 +38,7 @@ Adicione a dependência no seu `Cargo.toml` (via git ou path):
 
 ```toml
 [dependencies]
-baileys-socket = { git = "https://github.com/<seu-usuario>/<repo>.git", package = "baileys-socket" }
+baileys-socket = { git = "https://github.com/renatoiub/BaileysRust.git", package = "baileys-socket" }
 tokio = { version = "1", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tracing = "0.1"

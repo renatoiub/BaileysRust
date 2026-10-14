@@ -18,8 +18,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/renatoiub/api-baileys"
-homepage = "https://github.com/renatoiub/api-baileys"
+repository = "https://github.com/renatoiub/BaileysRust"
+homepage = "https://github.com/renatoiub/BaileysRust"
 authors = ["Renato Freitas <renatoiub@live.com>"]
 
 [workspace.dependencies]
