@@ -336,8 +336,11 @@ pub async fn ffmpeg_pipe(input: &[u8], args: &[&str]) -> Result<Vec<u8>, MediaEr
     cmd.args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .creation_flags(0x08000000); // CREATE_NO_WINDOW no Windows
+        .stderr(std::process::Stdio::piped());
+
+    // CREATE_NO_WINDOW só existe no Windows (tokio::process::Command).
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW no Windows
 
     let mut child = cmd.spawn().map_err(|_| MediaError::FfmpegUnavailable)?;
 
