@@ -1,12 +1,12 @@
 # BaileysRust
 
-Reimplementação em **Rust** da biblioteca WhatsApp Web (Baileys/Hineken) com
-**paridade de sessão, protocolo e API** com o container Node. Permite parear,
+Reimplementação em **Rust** da biblioteca WhatsApp Web (Baileys) com
+**paridade de sessão, protocolo e API**. Permite parear,
 enviar e receber mensagens E2E (texto, imagem, vídeo, áudio, documento), operar
 grupos e fazer chamadas — sem depender de Node.js.
 
 A biblioteca é **síncrona na camada de storage** e roda **100% no SQLite
-nativo** (igual ao `useSQLiteAuthState` do Node). Redis/RabbitMQ são acessórios
+nativo**. Redis/RabbitMQ são acessórios
 **opcionais** que o seu app injeta por cima, se quiser.
 
 ---
