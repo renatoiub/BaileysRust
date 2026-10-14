@@ -1,0 +1,11 @@
+[package]
+name = "baileys-codec"
+description = "Codec binário do WhatsApp (WABinary): encode/decode de nós com tokens e tags."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+baileys-core = { path = "../core" }
+flate2.workspace = true
+thiserror.workspace = true

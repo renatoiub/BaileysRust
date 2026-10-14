@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/codec",
+    "crates/crypto",
+    "crates/proto",
+    "crates/store",
+    "crates/socket",
+    "crates/signal",
+    "crates/repository",
+    "crates/media",
+    "crates/call",
+    "spike",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/renatoiub/api-baileys"
+homepage = "https://github.com/renatoiub/api-baileys"
+authors = ["Renato Freitas <renatoiub@live.com>"]
+
+[workspace.dependencies]
+# Shared workspace dependency versions (single source of truth).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+bytes = "1"
+rand = "0.8"
+base64 = "0.22"
+
+# Crypto
+curve25519-dalek = { version = "4", features = ["precomputed-tables"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes = "0.8"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+ctr = "0.9"
+cbc = "0.1"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+pbkdf2 = "0.12"
+subtle = "2"
+
+# Async runtime / IO
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Protobuf
+prost = "0.13"
+prost-types = "0.13"
+prost-build = "0.13"
+
+# HTTP client (media download / QR fetch)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+
+# Media
+flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# Misc
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+qrcode = "0.14"

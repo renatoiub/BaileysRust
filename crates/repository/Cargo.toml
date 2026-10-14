@@ -1,0 +1,15 @@
+[package]
+name = "baileys-repository"
+description = "SignalRepository: ponte de alto nível entre baileys-signal e baileys-store."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+baileys-core = { path = "../core" }
+baileys-crypto = { path = "../crypto" }
+baileys-signal = { path = "../signal" }
+baileys-store = { path = "../store" }
+thiserror.workspace = true
+base64.workspace = true
+serde_json.workspace = true

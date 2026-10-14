@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Sessões/credenciais locais (NUNCA versionar — creds reais do WhatsApp).
+/db
+/spike-session

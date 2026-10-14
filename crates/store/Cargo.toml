@@ -1,0 +1,17 @@
+[package]
+name = "baileys-store"
+description = "Auth state compatível com o Baileys: SQLite nativo (auth_data) com serde BufferJSON."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+baileys-core = { path = "../core" }
+baileys-crypto = { path = "../crypto" }
+baileys-proto = { path = "../proto" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+rand.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "baileys-media"
+description = "Processamento de mídia do WhatsApp: download, conversão via FFmpeg, thumbnails."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+baileys-core = { path = "../core" }
+baileys-crypto = { path = "../crypto" }
+tokio.workspace = true
+reqwest.workspace = true
+image.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+base64.workspace = true
+hmac.workspace = true
+rand.workspace = true

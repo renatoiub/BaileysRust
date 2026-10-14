@@ -1,0 +1,29 @@
+[package]
+name = "baileys-spike"
+description = "Spike da Fase 0: conecta no WhatsApp e executa o handshake Noise (go/no-go)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spike-connect"
+path = "src/main.rs"
+
+[dependencies]
+baileys-core = { path = "../crates/core" }
+baileys-codec = { path = "../crates/codec" }
+baileys-crypto = { path = "../crates/crypto" }
+baileys-proto = { path = "../crates/proto" }
+baileys-store = { path = "../crates/store" }
+baileys-socket = { path = "../crates/socket" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror.workspace = true
+prost.workspace = true
+rand.workspace = true
+base64.workspace = true
+serde_json.workspace = true
