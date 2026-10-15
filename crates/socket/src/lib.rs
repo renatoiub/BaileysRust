@@ -8,7 +8,12 @@ pub mod media;
 pub mod noise;
 pub mod usync;
 
-pub use client::{Client, ClientError, ClientEvent, ConnectionUpdate, DebugRetryParams, MediaUpload, SendMessageResult};
+pub use client::{
+    CallInfo, ChatUpdate, Client, ClientError, ClientEvent, ConnectionUpdate, ContactUpsert,
+    DebugRetryParams, GroupParticipantsUpdate, GroupUpdate, MediaUpload, MessageReceiptUpdate,
+    MessageReaction, MessageStatusUpdate, MessagingHistorySet, PresenceData, SendMessageResult,
+    WsSink,
+};
 pub use groups::{extract_group_metadata, GroupMetadata, GroupParticipant};
 pub use handshake::{
     configure_successful_pairing, generate_login_node, generate_registration_node, ClientConfig,

@@ -93,4 +93,13 @@ impl BinaryNode {
             _ => None,
         }
     }
+
+    /// Retorna o conteúdo do próprio nó como texto (String ou bytes UTF-8).
+    pub fn content_text(&self) -> String {
+        match &self.content {
+            Some(BinaryContent::String(s)) => s.clone(),
+            Some(BinaryContent::Bytes(b)) => String::from_utf8_lossy(b).to_string(),
+            _ => String::new(),
+        }
+    }
 }

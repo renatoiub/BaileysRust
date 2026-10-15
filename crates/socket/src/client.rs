@@ -40,6 +40,127 @@ use crate::handshake::{
 };
 use crate::noise::NoiseHandler;
 
+/// Presença de um contato (espelha `presence.update` do Baileys).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PresenceData {
+    /// JID normalizado do participante.
+    pub participant: String,
+    /// `available` | `unavailable` | `composing` | `paused` | `recording`.
+    pub last_known_presence: String,
+    /// Timestamp de último visto (segundos), se o servidor informou.
+    pub last_seen: Option<i64>,
+}
+
+/// Atualização de um chat (espelha `chats.update`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ChatUpdate {
+    pub id: String,
+    pub archived: Option<bool>,
+    pub unread_count: Option<i32>,
+    pub pinned: Option<u32>,
+    pub name: Option<String>,
+    pub read_only: Option<bool>,
+    pub ephemeral_expiration: Option<u32>,
+    pub tc_token: Option<Vec<u8>>,
+}
+
+/// Contato (espelha `contacts.upsert`/`contacts.update`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ContactUpsert {
+    pub id: String,
+    pub name: Option<String>,
+    pub lid: Option<String>,
+    pub jid: Option<String>,
+    pub notify: Option<String>,
+    pub verified_name: Option<String>,
+    pub img_url: Option<String>,
+}
+
+/// Atualização de grupo (espelha `groups.update`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct GroupUpdate {
+    pub id: String,
+    pub author: Option<String>,
+    pub subject: Option<String>,
+    pub desc: Option<String>,
+    pub announce: Option<bool>,
+    pub restrict: Option<bool>,
+    pub invite_code: Option<String>,
+    pub member_add_mode: Option<bool>,
+    pub join_approval_mode: Option<bool>,
+    pub suspended: Option<bool>,
+    pub deleted: Option<bool>,
+    pub delete_reason: Option<String>,
+}
+
+/// Atualização de participantes de grupo (espelha `group-participants.update`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct GroupParticipantsUpdate {
+    pub id: String,
+    pub author: Option<String>,
+    pub participants: Vec<String>,
+    pub action: String,
+}
+
+/// Atualização de status de mensagem (espelha `messages.update`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MessageStatusUpdate {
+    pub remote_jid: String,
+    pub id: String,
+    pub from_me: bool,
+    pub participant: Option<String>,
+    pub status: Option<i32>,
+    pub message_stub_type: Option<i32>,
+    pub message_stub_parameters: Vec<String>,
+}
+
+/// Receipt de entrega/leitura (espelha `message-receipt.update`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MessageReceiptUpdate {
+    pub remote_jid: String,
+    pub id: String,
+    pub from_me: bool,
+    pub user_jid: String,
+    pub receipt_timestamp: Option<i64>,
+    pub read_timestamp: Option<i64>,
+}
+
+/// Reação a mensagem (espelha `messages.reaction`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MessageReaction {
+    pub remote_jid: String,
+    pub id: String,
+    pub from_me: bool,
+    pub text: Option<String>,
+    pub sender_timestamp_ms: Option<i64>,
+}
+
+/// Histórico sincronizado (espelha `messaging-history.set`).
+#[derive(Debug, Clone, Default)]
+pub struct MessagingHistorySet {
+    pub chats: Vec<wa::Conversation>,
+    pub contacts: Vec<serde_json::Value>,
+    pub messages: Vec<wa::WebMessageInfo>,
+    pub is_latest: bool,
+    pub progress: u32,
+    pub sync_type: i32,
+}
+
+/// Chamada (espelha `call` do Baileys).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CallInfo {
+    pub chat_id: String,
+    pub from: String,
+    pub id: String,
+    pub caller_pn: Option<String>,
+    pub date: Option<i64>,
+    pub offline: bool,
+    pub status: String,
+    pub is_video: bool,
+    pub is_group: bool,
+    pub group_jid: Option<String>,
+}
+
 /// Eventos emitidos pelo client (espelho do `ev` do Baileys).
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
@@ -61,6 +182,36 @@ pub enum ClientEvent {
     },
     /// QR code disponível para pareamento.
     Qr(String),
+    /// `presence.update` / `chatstate` — presença de contatos.
+    PresenceUpdate {
+        id: String,
+        presences: Vec<PresenceData>,
+    },
+    /// `chats.update` — mudanças em chats (arquivar/ler/pin).
+    ChatsUpdate { chats: Vec<ChatUpdate> },
+    /// `chats.delete` — chats apagados.
+    ChatsDelete { jids: Vec<String> },
+    /// `contacts.update` — atualização de contatos.
+    ContactsUpdate { contacts: Vec<ContactUpsert> },
+    /// `contacts.upsert` — contatos novos/atualizados.
+    ContactsUpsert { contacts: Vec<ContactUpsert> },
+    /// `groups.upsert` — grupos novos.
+    GroupsUpsert { groups: Vec<serde_json::Value> },
+    /// `groups.update` — mudanças em grupos.
+    GroupsUpdate { updates: Vec<GroupUpdate> },
+    /// `group-participants.update` — participantes de grupo.
+    GroupParticipantsUpdate { update: GroupParticipantsUpdate },
+    /// `messages.update` — atualizações de status/revoque de mensagens.
+    MessagesUpdate { updates: Vec<MessageStatusUpdate> },
+    /// `message-receipt.update` — receipts em grupos/broadcast.
+    MessageReceiptUpdate { updates: Vec<MessageReceiptUpdate> },
+    /// `messages.reaction` — reações a mensagens.
+    MessagesReaction { reactions: Vec<MessageReaction> },
+    /// `messaging-history.set` — histórico sincronizado (history sync).
+    MessagingHistorySet { data: MessagingHistorySet },
+    /// `call` — eventos de chamada (parsed para webhook + nós brutos para
+    /// o CallManager/player bridge).
+    Call { calls: Vec<CallInfo>, raw_nodes: Vec<BinaryNode> },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -793,8 +944,277 @@ impl Client {
             return Ok(());
         }
 
+        // Presence (`CB:presence`) e chatstate (`CB:chatstate`).
+        if tag == "presence" {
+            self.handle_presence(node);
+            return Ok(());
+        }
+        if tag == "chatstate" {
+            self.handle_chatstate(node);
+            return Ok(());
+        }
+
+        // Chats (`chats.update`/`chats.delete`) — nós `<chat>`.
+        if tag == "chat" {
+            self.handle_chat_node(node);
+            return Ok(());
+        }
+
+        // Contatos (`contacts.update`/`contacts.upsert`) — nós `<contact>`.
+        if tag == "contact" {
+            self.handle_contact_node(node);
+            return Ok(());
+        }
+
+        // Call (`call` com `<offer>`) — além do ack acima, emite o evento
+        // `ClientEvent::Call` para o webhook e o call-player.
+        if tag == "call" {
+            self.handle_call_node(node);
+            return Ok(());
+        }
+
+        // Notificação de grupo (w:gp2) — criação/edição/participantes.
+        if tag == "notification" && node.attr("type") == Some("w:gp2") {
+            self.handle_group_notification(node);
+            return Ok(());
+        }
+
         tracing::debug!(tag, l2, "nó não tratado");
         Ok(())
+    }
+
+    /// Port de `presence.update` (CB:presence) — `<presence type="...">`.
+    fn handle_presence(&self, node: &BinaryNode) {
+        let from = node.attr("from").unwrap_or_default().to_string();
+        let last_known_presence = node.attr("type").unwrap_or("unavailable").to_string();
+        let last_seen = node.attr("last").and_then(|v| v.parse::<i64>().ok());
+        // O Node usa o `participant` do próprio attrs ou o `from`.
+        let participant = node.attr("participant").map(String::from).unwrap_or_else(|| from.clone());
+        let presence = PresenceData {
+            participant,
+            last_known_presence,
+            last_seen,
+        };
+        let _ = self.events.send(ClientEvent::PresenceUpdate {
+            id: from,
+            presences: vec![presence],
+        });
+    }
+
+    /// Port de `presence.update` para `CB:chatstate` (composing/paused/recording).
+    fn handle_chatstate(&self, node: &BinaryNode) {
+        let from = node.attr("from").unwrap_or_default().to_string();
+        // chatstate: o filho `<composing>|<paused>|<recording>` define o estado.
+        let state = if node.child("composing").is_some() {
+            "composing"
+        } else if node.child("paused").is_some() {
+            "paused"
+        } else if node.child("recording").is_some() {
+            "recording"
+        } else {
+            "available"
+        };
+        let presence = PresenceData {
+            participant: from.clone(),
+            last_known_presence: state.to_string(),
+            last_seen: None,
+        };
+        let _ = self.events.send(ClientEvent::PresenceUpdate {
+            id: from,
+            presences: vec![presence],
+        });
+    }
+
+    /// Port de `chats.update`/`chats.delete` a partir de nós `<chat>`.
+    fn handle_chat_node(&self, node: &BinaryNode) {
+        let from = node.attr("from").unwrap_or_default().to_string();
+        let chat_type = node.attr("type").unwrap_or_default().to_string();
+
+        // `chats.delete` (type="delete") ou `<chat jid>` marcado para remoção.
+        if chat_type == "delete" {
+            let jids = match &node.content {
+                Some(baileys_core::BinaryContent::Children(children)) => children
+                    .iter()
+                    .filter_map(|c| c.attr("jid").map(String::from))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if !jids.is_empty() {
+                let _ = self.events.send(ClientEvent::ChatsDelete { jids });
+            }
+            return;
+        }
+
+        let update = ChatUpdate {
+            id: from,
+            archived: node.attr("archive").and_then(|v| v.parse::<bool>().ok()),
+            unread_count: node.attr("count").and_then(|v| v.parse::<i32>().ok()),
+            pinned: node.attr("pin").and_then(|v| v.parse::<u32>().ok()),
+            name: node.attr("name").map(String::from),
+            read_only: node.attr("read_only").and_then(|v| v.parse::<bool>().ok()),
+            ephemeral_expiration: node
+                .attr("ephemeral")
+                .and_then(|v| v.parse::<u32>().ok()),
+            tc_token: node.child_bytes("tc_token").map(|b| b.to_vec()),
+        };
+        let _ = self.events.send(ClientEvent::ChatsUpdate {
+            chats: vec![update],
+        });
+    }
+
+    /// Port de `contacts.update`/`contacts.upsert` a partir de nós `<contact>`.
+    fn handle_contact_node(&self, node: &BinaryNode) {
+        let id = node.attr("jid").unwrap_or_default().to_string();
+        if id.is_empty() {
+            return;
+        }
+        let contact = ContactUpsert {
+            id: id.clone(),
+            name: node.attr("name").map(String::from),
+            lid: node.attr("lid").map(String::from),
+            jid: Some(id),
+            notify: node.attr("notify").map(String::from),
+            verified_name: node.attr("verify").map(String::from),
+            img_url: node.attr("img_url").map(String::from),
+        };
+        // `contacts.update` (update="true") vs `contacts.upsert` (padrão).
+        if node.attr("update").and_then(|v| v.parse::<bool>().ok()).unwrap_or(false) {
+            let _ = self.events.send(ClientEvent::ContactsUpdate {
+                contacts: vec![contact],
+            });
+        } else {
+            let _ = self.events.send(ClientEvent::ContactsUpsert {
+                contacts: vec![contact],
+            });
+        }
+    }
+
+    /// Port de `call` (evento `call` do Baileys) — emite `CallInfo`.
+    fn handle_call_node(&self, node: &BinaryNode) {
+        let from = node.attr("from").unwrap_or_default().to_string();
+        let id = node.attr("id").unwrap_or_default().to_string();
+        let status = node.attr("type").unwrap_or("offer").to_string();
+        let call_type = node.attr("call_type").unwrap_or_default().to_string();
+        let is_video = call_type == "video";
+        let is_group = baileys_core::is_jid_group(&from);
+
+        let call = CallInfo {
+            chat_id: from.clone(),
+            from: from.clone(),
+            id,
+            caller_pn: node.attr("caller_pn").map(String::from),
+            date: node.attr("t").and_then(|t| t.parse::<i64>().ok()),
+            offline: node.attr("offline").and_then(|v| v.parse::<bool>().ok()).unwrap_or(false),
+            status,
+            is_video,
+            is_group,
+            group_jid: if is_group { Some(from) } else { None },
+        };
+        let _ = self.events.send(ClientEvent::Call {
+            calls: vec![call],
+            raw_nodes: vec![node.clone()],
+        });
+    }
+
+    /// Port de `groups.upsert`/`groups.update`/`group-participants.update`
+    /// a partir de notificações `w:gp2`.
+    fn handle_group_notification(&self, node: &BinaryNode) {
+        let from = node.attr("from").unwrap_or_default().to_string();
+        let participant = node.attr("participant").map(String::from);
+
+        if let Some(create) = node.child("create") {
+            let group_json = self.group_node_to_json(create, &from);
+            let _ = self.events.send(ClientEvent::GroupsUpsert {
+                groups: vec![group_json],
+            });
+            return;
+        }
+
+        // Filhos de update: subject, description, etc.
+        let mut update = GroupUpdate {
+            id: from.clone(),
+            author: participant.clone(),
+            ..Default::default()
+        };
+        let mut has_update = false;
+        if let Some(subject) = node.child("subject") {
+            update.subject = Some(subject.attr("subject").unwrap_or_default().to_string());
+            update.author = subject.attr("participant").map(String::from).or(participant.clone());
+            has_update = true;
+        }
+        if let Some(desc) = node.child("description") {
+            update.desc = Some(desc.content_text());
+            update.author = desc.attr("participant").map(String::from).or(participant.clone());
+            has_update = true;
+        }
+        if let Some(announce) = node.child("announcement") {
+            update.announce = Some(true);
+            update.author = announce.attr("participant").map(String::from).or(participant.clone());
+            has_update = true;
+        }
+        if let Some(restrict) = node.child("locked") {
+            update.restrict = Some(true);
+            update.author = restrict.attr("participant").map(String::from).or(participant.clone());
+            has_update = true;
+        }
+        if let Some(code) = node.child("invite") {
+            update.invite_code = code.attr("code").map(String::from);
+            has_update = true;
+        }
+        if let Some(code) = node.child("code") {
+            update.invite_code = code.attr("code").map(String::from);
+            has_update = true;
+        }
+        if let Some(del) = node.child("delete") {
+            update.deleted = Some(true);
+            update.author = del.attr("participant").map(String::from).or(participant.clone());
+            has_update = true;
+        }
+
+        // Participantes: add/remove/promote/demote.
+        if let Some(participants_node) = node.child("add").or_else(|| node.child("remove")).or_else(|| node.child("promote")).or_else(|| node.child("demote")) {
+            let action = participants_node.tag.clone();
+            let mut jids: Vec<String> = Vec::new();
+            for child in participants_node.children("participant") {
+                if let Some(jid) = child.attr("jid") {
+                    jids.push(jid.to_string());
+                }
+            }
+            if !jids.is_empty() {
+                let _ = self.events.send(ClientEvent::GroupParticipantsUpdate {
+                    update: GroupParticipantsUpdate {
+                        id: from.clone(),
+                        author: participants_node.attr("participant").map(String::from).or(participant.clone()),
+                        participants: jids,
+                        action,
+                    },
+                });
+            }
+            return;
+        }
+
+        if has_update {
+            let _ = self.events.send(ClientEvent::GroupsUpdate {
+                updates: vec![update],
+            });
+        }
+    }
+
+    /// Converte um nó `<group>` (ou create) em JSON espelhando o
+    /// `parseGroupData` do Node (id, subject, subjectOwner, author, etc.).
+    fn group_node_to_json(&self, node: &BinaryNode, id: &str) -> serde_json::Value {
+        let mut json = serde_json::Map::new();
+        json.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+        json.insert("subject".to_string(), serde_json::Value::String(node.attr("subject").unwrap_or_default().to_string()));
+        json.insert("subjectOwner".to_string(), serde_json::Value::String(node.attr("s_o").unwrap_or_default().to_string()));
+        json.insert("subjectTime".to_string(), serde_json::Value::String(node.attr("s_t").unwrap_or_default().to_string()));
+        json.insert("size".to_string(), serde_json::Value::String(node.attr("size").unwrap_or_default().to_string()));
+        json.insert("creation".to_string(), serde_json::Value::String(node.attr("creation").unwrap_or_default().to_string()));
+        json.insert("desc".to_string(), serde_json::Value::String(node.content_text()));
+        json.insert("descId".to_string(), serde_json::Value::String(node.attr("id").unwrap_or_default().to_string()));
+        json.insert("restrict".to_string(), serde_json::Value::String(node.attr("restrict").unwrap_or_default().to_string()));
+        json.insert("announce".to_string(), serde_json::Value::String(node.attr("announce").unwrap_or_default().to_string()));
+        serde_json::Value::Object(json)
     }
 
     // --- handlers de pareamento / login ---
@@ -1232,6 +1652,37 @@ impl Client {
                                         }
                                     }
                                 }
+
+                                // Reação (messages.reaction).
+                                if let Some(reaction) = &msg.reaction_message {
+                                    let key = reaction.key.clone();
+                                    let remote_jid = key
+                                        .as_ref()
+                                        .and_then(|k| k.remote_jid.clone())
+                                        .unwrap_or_else(|| from.clone());
+                                    let id = key
+                                        .as_ref()
+                                        .and_then(|k| k.id.clone())
+                                        .unwrap_or_default();
+                                    let _ = self.events.send(ClientEvent::MessagesReaction {
+                                        reactions: vec![MessageReaction {
+                                            remote_jid,
+                                            id,
+                                            from_me: key
+                                                .as_ref()
+                                                .and_then(|k| k.from_me)
+                                                .unwrap_or(false),
+                                            text: reaction.text.clone(),
+                                            sender_timestamp_ms: reaction.sender_timestamp_ms,
+                                        }],
+                                    });
+                                }
+
+                                // ProtocolMessage: revoke/edit/history-sync.
+                                if let Some(protocol) = &msg.protocol_message {
+                                    self.handle_protocol_message(&protocol, &msg, &from, &participant)
+                                        .await;
+                                }
                             }
                             Err(e) => {
                                 tracing::debug!(error = %e, "falha ao decodificar Message");
@@ -1437,6 +1888,158 @@ impl Client {
 
         let sender = chat_id.clone();
         Some((full, author, sender))
+    }
+
+    /// Port de `processSyncAction`/`messaging-history.set` + `messages.update`
+    /// a partir de um `ProtocolMessage` (revoke, message edit, history sync).
+    async fn handle_protocol_message(
+        &self,
+        protocol: &wa::message::ProtocolMessage,
+        _msg: &wa::Message,
+        from: &str,
+        participant: &Option<String>,
+    ) {
+        let r#type = protocol.r#type.unwrap_or(-1);
+        let key = protocol.key.as_ref().cloned();
+
+        // Revoke / MessageEdit → messages.update.
+        if r#type == wa::message::protocol_message::Type::Revoke as i32
+            || r#type == wa::message::protocol_message::Type::MessageEdit as i32
+        {
+            let update = MessageStatusUpdate {
+                remote_jid: key
+                    .as_ref()
+                    .and_then(|k| k.remote_jid.clone())
+                    .unwrap_or_else(|| from.to_string()),
+                id: key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default(),
+                from_me: key.as_ref().and_then(|k| k.from_me).unwrap_or(false),
+                participant: key.as_ref().and_then(|k| k.participant.clone()).or_else(|| participant.clone()),
+                status: if r#type == wa::message::protocol_message::Type::Revoke as i32 {
+                    Some(wa::web_message_info::Status::Error as i32)
+                } else {
+                    None
+                },
+                message_stub_type: if r#type == wa::message::protocol_message::Type::Revoke as i32 {
+                    Some(wa::web_message_info::StubType::Revoke as i32)
+                } else {
+                    None
+                },
+                message_stub_parameters: vec![],
+            };
+            let _ = self.events.send(ClientEvent::MessagesUpdate {
+                updates: vec![update],
+            });
+            return;
+        }
+
+        // History sync notification → parse do payload (inline ou download).
+        if r#type == wa::message::protocol_message::Type::HistorySyncNotification as i32 {
+            if let Some(notification) = &protocol.history_sync_notification {
+                let sync_type = notification.sync_type.unwrap_or(0);
+                let progress = notification.progress.unwrap_or(0);
+                let is_latest = progress >= 100;
+
+                // Inline bootstrap payload (initialHistBootstrapInlinePayload)
+                // ou download via directPath (mediaKey + fileEncSha256).
+                let mut history: Option<wa::HistorySync> = None;
+                if let Some(inline) = &notification.initial_hist_bootstrap_inline_payload {
+                    if let Ok(decoded) = wa::HistorySync::decode(inline.as_slice()) {
+                        history = Some(decoded);
+                    }
+                } else if let Some(decoded) = self.download_history_sync(notification).await {
+                    history = Some(decoded);
+                }
+
+                if let Some(h) = history {
+                    let chats: Vec<wa::Conversation> = h.conversations;
+                    let messages: Vec<wa::WebMessageInfo> = chats
+                        .iter()
+                        .flat_map(|c| {
+                            c.messages
+                                .iter()
+                                .filter_map(|m| m.message.clone())
+                        })
+                        .collect();
+                    let contacts: Vec<serde_json::Value> = h
+                        .pushnames
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "id": p.id,
+                                "pushName": p.pushname,
+                            })
+                        })
+                        .collect();
+                    let _ = self.events.send(ClientEvent::MessagingHistorySet {
+                        data: MessagingHistorySet {
+                            chats,
+                            contacts,
+                            messages,
+                            is_latest,
+                            progress,
+                            sync_type,
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    /// Baixa e decodifica um `HistorySync` do CDN (port de
+    /// `downloadAndProcessHistorySyncNotification`).
+    async fn download_history_sync(
+        &self,
+        notification: &wa::message::HistorySyncNotification,
+    ) -> Option<wa::HistorySync> {
+        let direct_path = notification.direct_path.as_ref()?;
+        let media_key = notification.media_key.as_ref()?;
+        if direct_path.is_empty() || media_key.is_empty() {
+            return None;
+        }
+
+        let url = baileys_media::url_from_direct_path(direct_path);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .ok()?;
+        let bytes = client.get(&url).send().await.ok()?.bytes().await.ok()?;
+
+        // Keys: HKDF "WhatsApp History Keys" (mesma derivação do Baileys).
+        let expanded = baileys_crypto::hkdf(
+            media_key,
+            80,
+            None,
+            "WhatsApp History Keys",
+        )
+        .ok()?;
+        let iv = &expanded[0..16];
+        let cipher_key = &expanded[16..48];
+        let _mac_key = &expanded[48..80];
+
+        // ciphertext || mac(32) — remove o tail de MAC e alinha a 16 bytes.
+        let body = &bytes[..(bytes.len() / 16) * 16];
+        let mut data = baileys_crypto::aes_decrypt_cbc(body, cipher_key, iv).ok()?;
+
+        // Remove padding PKCS7 (o Baileys usa `unpadRandomMax16` no path
+        // inline; o download do history usa PKCS7 padrão do AES-CBC).
+        if let Some(&pad) = data.last() {
+            if (1..=16).contains(&pad) && data.len() >= pad as usize {
+                data.truncate(data.len() - pad as usize);
+            }
+        }
+
+        // Gzip?
+        let decoded: Vec<u8> = if data.len() > 2 && data[0] == 0x1f && data[1] == 0x8b {
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(data.as_slice());
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).ok()?;
+            out
+        } else {
+            data
+        };
+
+        wa::HistorySync::decode(decoded.as_slice()).ok()
     }
 
     async fn send_message_ack(
@@ -1955,6 +2558,62 @@ impl Client {
             msg_id,
             "receipt recebido"
         );
+
+        // `message-receipt.update` (delivery/read/sender) — emitido para
+        // todos os tipos, exceto `retry` (que é processado abaixo).
+        if receipt_type != "retry" && !msg_id.is_empty() {
+            let children: Vec<&baileys_core::BinaryNode> = match &node.content {
+                Some(baileys_core::BinaryContent::Children(c)) => c.iter().collect(),
+                _ => Vec::new(),
+            };
+            let mut updates: Vec<MessageReceiptUpdate> = Vec::new();
+            // Coleta os jids de `<receipt>`/`<list>` filhos + o do próprio nó.
+            let mut user_jids: Vec<String> = Vec::new();
+            for child in children {
+                for sub in child.children("receipt") {
+                    if let Some(jid) = sub.attr("jid") {
+                        user_jids.push(jid.to_string());
+                    }
+                }
+                for sub in child.children("list") {
+                    if let Some(jid) = sub.attr("jid") {
+                        user_jids.push(jid.to_string());
+                    }
+                }
+            }
+            if user_jids.is_empty() {
+                user_jids.push(participant.clone().unwrap_or_else(|| from.clone()));
+            }
+
+            let is_node_from_me = {
+                let me = self.store.creds().me.clone();
+                let p_or_from = participant.clone().unwrap_or_else(|| from.clone());
+                let me_id = me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
+                let me_lid = me.and_then(|m| m.lid).unwrap_or_else(|| me_id.clone());
+                are_jids_same_user(&p_or_from, &me_id)
+                    || (!me_lid.is_empty() && are_jids_same_user(&p_or_from, &me_lid))
+            };
+
+            let read_timestamp = node
+                .child("read")
+                .and_then(|r| r.attr("t"))
+                .and_then(|t| t.parse::<i64>().ok());
+            let receipt_timestamp = node.attr("t").and_then(|t| t.parse::<i64>().ok());
+
+            for user_jid in user_jids {
+                updates.push(MessageReceiptUpdate {
+                    remote_jid: from.clone(),
+                    id: msg_id.clone(),
+                    from_me: is_node_from_me,
+                    user_jid,
+                    receipt_timestamp,
+                    read_timestamp,
+                });
+            }
+            if !updates.is_empty() {
+                let _ = self.events.send(ClientEvent::MessageReceiptUpdate { updates });
+            }
+        }
 
         if receipt_type != "retry" {
             return Ok(());

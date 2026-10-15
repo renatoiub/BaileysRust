@@ -615,6 +615,59 @@ impl NativeCallManager {
             None => false,
         }
     }
+
+    /// `setExternalAudioMode` — alimenta o áudio via WS do player (não arquivo).
+    pub fn set_external_audio_mode(&self, enabled: bool) {
+        self.audio_engine.set_external_mode(enabled);
+    }
+
+    /// `feedLiveAudio` — injeta PCM f32 (do WS binário do player).
+    pub fn feed_live_audio(&self, samples: &[f32]) {
+        self.audio_engine.feed_external_audio(samples);
+    }
+
+    /// `setMute` — muta/desmuta a chamada ativa (silence mode + mute_v2).
+    pub async fn set_mute(&self, muted: bool) -> Result<(), CallError> {
+        {
+            let mut cur = self.current_call.lock().await;
+            let Some(call) = cur.as_mut() else {
+                return Ok(());
+            };
+            if !call.is_active() {
+                return Ok(());
+            }
+            if let Err(e) = call.apply_transition(CallTransition::AudioMuteChanged { muted }) {
+                // Não propaga transição inválida — o player tolera.
+                let _ = e;
+            }
+        }
+
+        self.audio_engine.set_silence_mode(muted);
+
+        // Envia `mute_v2` para o peer (paridade `setMute` do TS).
+        let (peer_jid, call_id, call_creator) = {
+            let cur = self.current_call.lock().await;
+            match cur.as_ref() {
+                Some(c) => (c.peer_jid.clone(), c.call_id.clone(), c.call_creator.clone()),
+                None => return Ok(()),
+            }
+        };
+        let me_id = self.socket.me_id();
+        let stanza = build_mute_v2_stanza(
+            &crate::signaling::ensure_device_jid(&call_creator),
+            &call_id,
+            &call_creator,
+            if muted { 1 } else { 0 },
+            Some(&me_id),
+        );
+        self.socket.send_node(&stanza).map_err(CallError::Socket)?;
+
+        let _ = self.events.send(CallEvent::StateChanged {
+            call_id,
+            state: CallState::Active,
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]

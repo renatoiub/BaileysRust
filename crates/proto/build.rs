@@ -28,6 +28,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("PROTOC", protobuf_src::protoc());
 
     let mut config = prost_build::Config::new();
+    // Deriva `ReflectMessage` em todas as mensagens (para o serializer JSON
+    // camelCase do `lib.rs` — paridade com o `JSON.stringify` do Node) e
+    // gera o FileDescriptorSet.
+    let mut builder = prost_reflect_build::Builder::new();
+    builder
+        .file_descriptor_set_bytes("crate::FILE_DESCRIPTOR_SET_BYTES")
+        .file_descriptor_set_path(
+            std::path::Path::new(&out_dir).join("file_descriptor_set.bin"),
+        );
+    builder
+        .configure(&mut config, &[&out_proto], &[out_proto.parent().unwrap()])
+        .expect("falha ao configurar prost-reflect");
+
     config.compile_protos(&[&out_proto], &[out_proto.parent().unwrap()])?;
 
     let mut marker = std::fs::File::create(std::path::Path::new(&out_dir).join("proto-built"))?;
