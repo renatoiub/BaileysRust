@@ -161,6 +161,19 @@ pub struct CallInfo {
     pub group_jid: Option<String>,
 }
 
+/// Campos extras do `key` que não existem no proto `MessageKey`
+/// (espelha o `WAMessageKey` do Hineken: `sender_lid`, `participant_lid`,
+/// `participant_pn`, `sender_pn`, `peer_recipient_pn`, `peer_recipient_lid`).
+#[derive(Debug, Clone, Default)]
+pub struct MessageKeyExtras {
+    pub sender_lid: Option<String>,
+    pub participant_lid: Option<String>,
+    pub participant_pn: Option<String>,
+    pub sender_pn: Option<String>,
+    pub peer_recipient_pn: Option<String>,
+    pub peer_recipient_lid: Option<String>,
+}
+
 /// Eventos emitidos pelo client (espelho do `ev` do Baileys).
 #[derive(Debug, Clone)]
 pub enum ClientEvent {
@@ -172,6 +185,7 @@ pub enum ClientEvent {
     Message {
         info: wa::WebMessageInfo,
         raw: BinaryNode,
+        key_extras: MessageKeyExtras,
     },
     /// Mensagem que falhou ao descriptografar (nó bruto + motivo). O retry
     /// agora é MANUAL (via manager): não enviamos receipt/PDO automático.
@@ -1559,7 +1573,7 @@ impl Client {
         self.send_message_ack(node, sink).await?;
 
         // Decodifica o envelope.
-        let Some((full_message, author, sender)) = self.decode_message_node(node) else {
+        let Some((full_message, author, sender, key_extras)) = self.decode_message_node(node) else {
             tracing::debug!(from = %from, "decode_message_node retornou None (mensagem ignorada)");
             return Ok(());
         };
@@ -1788,7 +1802,9 @@ impl Client {
         let is_ciphertext = info.message_stub_type
             == Some(wa::web_message_info::StubType::Ciphertext as i32);
         if !is_ciphertext && !info.key.clone().unwrap_or_default().from_me.unwrap_or(false) {
-            let remote = info.key.clone().and_then(|k| k.remote_jid).unwrap_or_else(|| from.clone());
+            // Paridade Node: o receipt usa o `remoteJid` CRU (chatId antes do
+            // `cleanMessage`); só o key do webhook é normalizado.
+            let remote = sender.clone();
             let msg_id = info.key.clone().and_then(|k| k.id).unwrap_or_default();
             self.send_receipt(&remote, participant.as_deref(), &[msg_id], None, sink).await?;
         }
@@ -1796,6 +1812,7 @@ impl Client {
         let _ = self.events.send(ClientEvent::Message {
             info: info.clone(),
             raw: node.clone(),
+            key_extras,
         });
         tracing::debug!(from = %from, msg_id = %info.key.clone().and_then(|k| k.id).unwrap_or_default(), "evento Message emitido");
 
@@ -1807,13 +1824,17 @@ impl Client {
     fn decode_message_node(
         &self,
         stanza: &BinaryNode,
-    ) -> Option<(wa::WebMessageInfo, String, String)> {
+    ) -> Option<(wa::WebMessageInfo, String, String, MessageKeyExtras)> {
         let msg_id = stanza.attr("id").unwrap_or_default().to_string();
         let from = stanza.attr("from").unwrap_or_default().to_string();
         let participant = stanza.attr("participant").map(String::from);
         let recipient = stanza.attr("recipient").map(String::from);
         let sender_lid = stanza.attr("sender_lid").map(String::from);
         let participant_lid = stanza.attr("participant_lid").map(String::from);
+        let participant_pn = stanza.attr("participant_pn").map(String::from);
+        let sender_pn = stanza.attr("sender_pn").map(String::from);
+        let peer_recipient_pn = stanza.attr("peer_recipient_pn").map(String::from);
+        let peer_recipient_lid = stanza.attr("peer_recipient_lid").map(String::from);
 
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
         let me_lid = self
@@ -1862,15 +1883,24 @@ impl Client {
             };
             (from.clone(), author)
         } else {
-            let author = participant_lid.unwrap_or_else(|| participant.clone().unwrap_or_default());
+            let author = participant_lid.clone().unwrap_or_else(|| participant.clone().unwrap_or_default());
             (from.clone(), author)
         };
 
+        // Paridade `cleanMessage` (Hineken): o `key` é normalizado
+        // (`jidNormalizedUser` em remoteJid e participant). `author`/`sender`
+        // internos continuam com LID/device para a descriptografia.
+        let normalized_remote = baileys_core::jid_normalized_user(&chat_id);
+        let normalized_participant = participant
+            .as_deref()
+            .map(baileys_core::jid_normalized_user)
+            .filter(|s| !s.is_empty());
+
         let key = wa::MessageKey {
-            remote_jid: Some(chat_id.clone()),
+            remote_jid: Some(normalized_remote),
             from_me: Some(from_me),
             id: Some(msg_id.clone()),
-            participant: participant.clone(),
+            participant: normalized_participant,
         };
 
         let full = wa::WebMessageInfo {
@@ -1886,8 +1916,17 @@ impl Client {
             ..Default::default()
         };
 
+        let key_extras = MessageKeyExtras {
+            sender_lid,
+            participant_lid,
+            participant_pn,
+            sender_pn,
+            peer_recipient_pn,
+            peer_recipient_lid,
+        };
+
         let sender = chat_id.clone();
-        Some((full, author, sender))
+        Some((full, author, sender, key_extras))
     }
 
     /// Port de `processSyncAction`/`messaging-history.set` + `messages.update`
@@ -2128,7 +2167,7 @@ impl Client {
         // Decodifica o envelope para obter o msgKey (remoteJid).
         let remote_jid = self
             .decode_message_node(node)
-            .map(|(full, _, _)| full.key.and_then(|k| k.remote_jid).unwrap_or_default())
+            .map(|(full, _, _, _)| full.key.and_then(|k| k.remote_jid).unwrap_or_default())
             .unwrap_or_default();
         let cache_key = format!("{msg_id}:{remote_jid}");
         const MAX_MSG_RETRY_COUNT: u32 = 5;
@@ -2148,7 +2187,7 @@ impl Client {
             tracing::info!(msg_id, retry_count, "pedindo reenvio ao celular (PDO) após retry com keys");
             let msg_key = self
                 .decode_message_node(node)
-                .and_then(|(full, _, _)| full.key);
+                .and_then(|(full, _, _, _)| full.key);
             if let Some(key) = msg_key {
                 // Task separada: o PDO faz `assert_sessions` → `query_node`
                 // (aguarda resposta do servidor). Inline no loop de leitura =
