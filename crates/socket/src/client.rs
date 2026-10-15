@@ -102,27 +102,54 @@ pub struct GroupParticipantsUpdate {
     pub action: String,
 }
 
-/// Atualização de status de mensagem (espelha `messages.update`).
+/// `key` de uma atualização (espelha `proto.IMessageKey` serializado).
 #[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct MessageStatusUpdate {
+#[serde(rename_all = "camelCase")]
+pub struct MessageUpdateKey {
     pub remote_jid: String,
     pub id: String,
     pub from_me: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub participant: Option<String>,
+}
+
+/// `update` do `messages.update` (espelha `WAMessageUpdate.update`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageUpdateData {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message_stub_type: Option<i32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub message_stub_parameters: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<serde_json::Value>,
+}
+
+/// Atualização de status de mensagem (espelha `messages.update`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MessageStatusUpdate {
+    pub key: MessageUpdateKey,
+    pub update: MessageUpdateData,
+}
+
+/// Receipt de usuário (espelha `proto.IUserReceipt` serializado).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserReceipt {
+    pub user_jid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_timestamp: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_timestamp: Option<i64>,
 }
 
 /// Receipt de entrega/leitura (espelha `message-receipt.update`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct MessageReceiptUpdate {
-    pub remote_jid: String,
-    pub id: String,
-    pub from_me: bool,
-    pub user_jid: String,
-    pub receipt_timestamp: Option<i64>,
-    pub read_timestamp: Option<i64>,
+    pub key: MessageUpdateKey,
+    pub receipt: UserReceipt,
 }
 
 /// Reação a mensagem (espelha `messages.reaction`).
@@ -1945,25 +1972,29 @@ impl Client {
         if r#type == wa::message::protocol_message::Type::Revoke as i32
             || r#type == wa::message::protocol_message::Type::MessageEdit as i32
         {
+            let is_revoke = r#type == wa::message::protocol_message::Type::Revoke as i32;
             let update = MessageStatusUpdate {
-                remote_jid: key
-                    .as_ref()
-                    .and_then(|k| k.remote_jid.clone())
-                    .unwrap_or_else(|| from.to_string()),
-                id: key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default(),
-                from_me: key.as_ref().and_then(|k| k.from_me).unwrap_or(false),
-                participant: key.as_ref().and_then(|k| k.participant.clone()).or_else(|| participant.clone()),
-                status: if r#type == wa::message::protocol_message::Type::Revoke as i32 {
-                    Some(wa::web_message_info::Status::Error as i32)
-                } else {
-                    None
+                key: MessageUpdateKey {
+                    remote_jid: key
+                        .as_ref()
+                        .and_then(|k| k.remote_jid.clone())
+                        .unwrap_or_else(|| from.to_string()),
+                    id: key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default(),
+                    from_me: key.as_ref().and_then(|k| k.from_me).unwrap_or(false),
+                    participant: key
+                        .as_ref()
+                        .and_then(|k| k.participant.clone())
+                        .or_else(|| participant.clone()),
                 },
-                message_stub_type: if r#type == wa::message::protocol_message::Type::Revoke as i32 {
-                    Some(wa::web_message_info::StubType::Revoke as i32)
-                } else {
-                    None
+                update: MessageUpdateData {
+                    message_stub_type: if is_revoke {
+                        Some(wa::web_message_info::StubType::Revoke as i32)
+                    } else {
+                        None
+                    },
+                    message: if is_revoke { Some(serde_json::Value::Null) } else { None },
+                    ..Default::default()
                 },
-                message_stub_parameters: vec![],
             };
             let _ = self.events.send(ClientEvent::MessagesUpdate {
                 updates: vec![update],
@@ -2598,59 +2629,96 @@ impl Client {
             "receipt recebido"
         );
 
-        // `message-receipt.update` (delivery/read/sender) — emitido para
-        // todos os tipos, exceto `retry` (que é processado abaixo).
+        // `message-receipt.update` / `messages.update` — port exato do
+        // `handleReceipt` do Hineken (messages-recv.ts). Só emite para
+        // `type != "retry"` (retry é processado abaixo).
         if receipt_type != "retry" && !msg_id.is_empty() {
-            let children: Vec<&baileys_core::BinaryNode> = match &node.content {
-                Some(baileys_core::BinaryContent::Children(c)) => c.iter().collect(),
-                _ => Vec::new(),
-            };
-            let mut updates: Vec<MessageReceiptUpdate> = Vec::new();
-            // Coleta os jids de `<receipt>`/`<list>` filhos + o do próprio nó.
-            let mut user_jids: Vec<String> = Vec::new();
-            for child in children {
-                for sub in child.children("receipt") {
-                    if let Some(jid) = sub.attr("jid") {
-                        user_jids.push(jid.to_string());
+            // `ids = [attrs.id]` + ids dos filhos `<item>` de `content[0]`.
+            let mut ids: Vec<String> = vec![msg_id.clone()];
+            if let Some(baileys_core::BinaryContent::Children(children)) = &node.content {
+                if let Some(first) = children.first() {
+                    for item in first.children("item") {
+                        if let Some(id) = item.attr("id") {
+                            ids.push(id.to_string());
+                        }
                     }
                 }
-                for sub in child.children("list") {
-                    if let Some(jid) = sub.attr("jid") {
-                        user_jids.push(jid.to_string());
-                    }
-                }
-            }
-            if user_jids.is_empty() {
-                user_jids.push(participant.clone().unwrap_or_else(|| from.clone()));
             }
 
-            let is_node_from_me = {
-                let me = self.store.creds().me.clone();
-                let p_or_from = participant.clone().unwrap_or_else(|| from.clone());
-                let me_id = me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
-                let me_lid = me.and_then(|m| m.lid).unwrap_or_else(|| me_id.clone());
+            // `isLid` + `isNodeFromMe` (Node usa me.lid ou me.id conforme o from).
+            let me = self.store.creds().me.clone();
+            let me_id = me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
+            let me_lid = me.and_then(|m| m.lid).unwrap_or_else(|| me_id.clone());
+            let is_lid = from.ends_with("@lid");
+            let p_or_from = participant.clone().unwrap_or_else(|| from.clone());
+            let is_node_from_me = if is_lid {
+                are_jids_same_user(&p_or_from, &me_lid)
+            } else {
                 are_jids_same_user(&p_or_from, &me_id)
-                    || (!me_lid.is_empty() && are_jids_same_user(&p_or_from, &me_lid))
             };
 
-            let read_timestamp = node
-                .child("read")
-                .and_then(|r| r.attr("t"))
-                .and_then(|t| t.parse::<i64>().ok());
-            let receipt_timestamp = node.attr("t").and_then(|t| t.parse::<i64>().ok());
+            // `remoteJid` e `fromMe` do Node.
+            let remote = if !is_node_from_me || baileys_core::is_jid_group(&from) {
+                from.clone()
+            } else {
+                recipient.clone().unwrap_or_else(|| from.clone())
+            };
+            let from_me = recipient.is_none()
+                || ((receipt_type == "retry" || receipt_type == "sender") && is_node_from_me);
 
-            for user_jid in user_jids {
-                updates.push(MessageReceiptUpdate {
-                    remote_jid: from.clone(),
-                    id: msg_id.clone(),
-                    from_me: is_node_from_me,
-                    user_jid,
-                    receipt_timestamp,
-                    read_timestamp,
-                });
-            }
-            if !updates.is_empty() {
-                let _ = self.events.send(ClientEvent::MessageReceiptUpdate { updates });
+            let status = get_status_from_receipt_type(node.attr("type"));
+
+            // `status >= PENDING || !isNodeFromMe`.
+            let status_ok = status.map(|s| s >= wa::web_message_info::Status::Pending as i32).unwrap_or(false);
+            if status_ok || !is_node_from_me {
+                let t = node.attr("t").and_then(|v| v.parse::<i64>().ok());
+
+                if baileys_core::is_jid_group(&remote) || baileys_core::is_jid_status_broadcast(&remote) {
+                    // Grupo/broadcast: `message-receipt.update` quando há participant.
+                    if let Some(ref participant_jid) = participant {
+                        let update_key = if status == Some(wa::web_message_info::Status::DeliveryAck as i32) {
+                            "receiptTimestamp"
+                        } else {
+                            "readTimestamp"
+                        };
+                        let user_jid = baileys_core::jid_normalized_user(participant_jid);
+                        let receipts: Vec<MessageReceiptUpdate> = ids
+                            .iter()
+                            .map(|id| MessageReceiptUpdate {
+                                key: MessageUpdateKey {
+                                    remote_jid: remote.clone(),
+                                    id: id.clone(),
+                                    from_me,
+                                    participant: Some(participant_jid.clone()),
+                                },
+                                receipt: UserReceipt {
+                                    user_jid: user_jid.clone(),
+                                    receipt_timestamp: if update_key == "receiptTimestamp" { t } else { None },
+                                    read_timestamp: if update_key == "readTimestamp" { t } else { None },
+                                },
+                            })
+                            .collect();
+                        let _ = self.events.send(ClientEvent::MessageReceiptUpdate { updates: receipts });
+                    }
+                } else {
+                    // 1:1: `messages.update` com `update: { status }`.
+                    let updates: Vec<MessageStatusUpdate> = ids
+                        .iter()
+                        .map(|id| MessageStatusUpdate {
+                            key: MessageUpdateKey {
+                                remote_jid: remote.clone(),
+                                id: id.clone(),
+                                from_me,
+                                participant: participant.clone(),
+                            },
+                            update: MessageUpdateData {
+                                status,
+                                ..Default::default()
+                            },
+                        })
+                        .collect();
+                    let _ = self.events.send(ClientEvent::MessagesUpdate { updates });
+                }
             }
         }
 
@@ -4463,6 +4531,17 @@ fn is_lid_user(jid: &str) -> bool {
 
 fn is_jid_group(jid: &str) -> bool {
     baileys_core::is_jid_group(jid)
+}
+
+/// `getStatusFromReceiptType` (port de `Utils/generics.ts` do Hineken).
+fn get_status_from_receipt_type(r#type: Option<&str>) -> Option<i32> {
+    match r#type {
+        Some("sender") => Some(wa::web_message_info::Status::ServerAck as i32),
+        Some("played") => Some(wa::web_message_info::Status::Played as i32),
+        Some("read") | Some("read-self") => Some(wa::web_message_info::Status::Read as i32),
+        None => Some(wa::web_message_info::Status::DeliveryAck as i32),
+        _ => None,
+    }
 }
 
 fn are_jids_same_user(a: &str, b: &str) -> bool {

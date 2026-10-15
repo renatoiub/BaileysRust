@@ -11,8 +11,8 @@ pub mod usync;
 pub use client::{
     CallInfo, ChatUpdate, Client, ClientError, ClientEvent, ConnectionUpdate, ContactUpsert,
     DebugRetryParams, GroupParticipantsUpdate, GroupUpdate, MediaUpload, MessageKeyExtras,
-    MessageReceiptUpdate, MessageReaction, MessageStatusUpdate, MessagingHistorySet, PresenceData,
-    SendMessageResult, WsSink,
+    MessageReceiptUpdate, MessageReaction, MessageStatusUpdate, MessageUpdateData, MessageUpdateKey,
+    MessagingHistorySet, PresenceData, SendMessageResult, UserReceipt, WsSink,
 };
 pub use groups::{extract_group_metadata, GroupMetadata, GroupParticipant};
 pub use handshake::{
