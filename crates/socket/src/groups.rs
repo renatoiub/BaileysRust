@@ -15,7 +15,7 @@ pub fn generate_sender_key() -> String {
 }
 
 /// Metadados de um grupo (espelha `Types/GroupMetadata.ts`).
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMetadata {
     pub id: String,
@@ -44,7 +44,7 @@ pub struct GroupMetadata {
 }
 
 /// Participante de grupo.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupParticipant {
     pub id: String,

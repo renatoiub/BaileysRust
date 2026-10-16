@@ -11,10 +11,10 @@
 //!   O pipeline de baixo nível (`upload_media` + `send_media_message`) também
 //!   é público para mídia/lista/contato/localização arbitrária.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine;
 use baileys_codec::encode_binary_node;
@@ -311,92 +311,7 @@ pub struct MediaUpload {
 
 type PendingQuery = tokio::sync::oneshot::Sender<BinaryNode>;
 
-/// Entrada de cache TTL (port dos caches do Hineken `cache-utils.ts`).
-struct TtlEntry<T> {
-    value: T,
-    stored_at: Instant,
-    ttl: Duration,
-}
-
-impl<T> TtlEntry<T> {
-    fn new(value: T, ttl: Duration) -> Self {
-        Self {
-            value,
-            stored_at: Instant::now(),
-            ttl,
-        }
-    }
-
-    fn is_expired(&self) -> bool {
-        self.stored_at.elapsed() >= self.ttl
-    }
-}
-
-/// Cache TTL simples em memória (evita requisições repetidas ao servidor e
-/// risco de banimento — espelha `@cacheable/node-cache` do Hineken).
-struct TtlCache<T> {
-    inner: Mutex<HashMap<String, TtlEntry<T>>>,
-    default_ttl: Duration,
-    max_keys: usize,
-}
-
-impl<T: Clone> TtlCache<T> {
-    fn new(default_ttl: Duration, max_keys: usize) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            default_ttl,
-            max_keys,
-        }
-    }
-
-    async fn get(&self, key: &str) -> Option<T> {
-        let mut map = self.inner.lock().await;
-        match map.get(key) {
-            Some(entry) if !entry.is_expired() => Some(entry.value.clone()),
-            Some(_) => {
-                map.remove(key);
-                None
-            }
-            None => None,
-        }
-    }
-
-    async fn set(&self, key: String, value: T) {
-        self.set_with_ttl(key, value, self.default_ttl).await;
-    }
-
-    async fn set_with_ttl(&self, key: String, value: T, ttl: Duration) {
-        let mut map = self.inner.lock().await;
-        if map.len() >= self.max_keys {
-            // Limpeza simples: remove expirados; se ainda cheio, remove a
-            // chave mais antiga (aproximação do maxKeys do node-cache).
-            let now = Instant::now();
-            map.retain(|_, e| now.duration_since(e.stored_at) < e.ttl);
-            if map.len() >= self.max_keys {
-                if let Some(oldest) = map
-                    .iter()
-                    .min_by_key(|(_, e)| e.stored_at)
-                    .map(|(k, _)| k.clone())
-                {
-                    map.remove(&oldest);
-                }
-            }
-        }
-        map.insert(key, TtlEntry::new(value, ttl));
-    }
-
-    async fn contains(&self, key: &str) -> bool {
-        let mut map = self.inner.lock().await;
-        match map.get(key) {
-            Some(entry) if !entry.is_expired() => true,
-            Some(_) => {
-                map.remove(key);
-                false
-            }
-            None => false,
-        }
-    }
-}
+use crate::cache::{CacheStore, TtlCache};
 
 /// Sink de escrita do WebSocket (compartilhado entre `run` e as operações).
 pub type WsSink = Arc<
@@ -442,7 +357,7 @@ pub struct Client {
     /// reenvio em `<receipt type="retry">` (port de `sendMessageCache`).
     send_cache: Mutex<HashMap<String, (String, Vec<u8>)>>,
     /// JIDs cuja sessão E2E já foi forçada uma vez (port de `caches.forceSession`).
-    force_session_cache: Mutex<HashSet<String>>,
+    force_session_cache: TtlCache<()>,
     /// Mutex de retry (port de `retryMutex` do Node) — serializa o
     /// processamento de `<receipt type="retry">` concorrentes.
     retry_mutex: Mutex<()>,
@@ -493,7 +408,7 @@ impl Client {
             last_close_code: AtomicI32::new(0),
             qr_rotation: Mutex::new(None),
             send_cache: Mutex::new(HashMap::new()),
-            force_session_cache: Mutex::new(HashSet::new()),
+            force_session_cache: TtlCache::new(Duration::from_secs(86400), 2000),
             retry_mutex: Mutex::new(()),
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
@@ -561,6 +476,31 @@ impl Client {
     /// pre-key via `load`/`store`/`remove`).
     pub fn set_store_extension(&self, ext: Arc<dyn SignalStoreExtension>) {
         self.store.set_extension(ext);
+    }
+
+    /// Registra o backend externo de cache (ex. Redis) para todos os caches.
+    ///
+    /// - Globais/compartilhados: `cache:global:{namespace}`.
+    /// - Por conexão: `cache:instance:{instanceKey}:{namespace}` (isolados por
+    ///   instância para não misturar conexões do mesmo container nem de
+    ///   containers diferentes).
+    ///
+    /// O `TtlCache` faz fallback automático para memória quando o backend
+    /// falha, então a operação não é interrompida.
+    pub fn set_cache_backend(&self, instance_key: &str, backend: Arc<dyn CacheStore>) {
+        self.lid_cache.set_backend("cache:global:lid", Some(backend.clone()));
+        self.devices_cache.set_backend("cache:global:devices", Some(backend.clone()));
+        self.on_whatsapp_cache.set_backend("cache:global:onwhatsapp", Some(backend.clone()));
+        self.profile_picture_cache.set_backend("cache:global:profilepic", Some(backend.clone()));
+        self.group_meta_cache.set_backend("cache:global:groupmeta", Some(backend.clone()));
+        self.sender_key_memory
+            .set_backend(&format!("cache:instance:{instance_key}:senderkey"), Some(backend.clone()));
+        self.msg_retry_cache
+            .set_backend(&format!("cache:instance:{instance_key}:msgretry"), Some(backend.clone()));
+        self.placeholder_resend_cache
+            .set_backend(&format!("cache:instance:{instance_key}:placeholder"), Some(backend.clone()));
+        self.force_session_cache
+            .set_backend(&format!("cache:instance:{instance_key}:forcesession"), Some(backend));
     }
 
     /// Criptografa uma mensagem E2E para um JID (usado pelo CallManager).
@@ -2255,11 +2195,10 @@ impl Client {
             self.get_lid(&retry_jid, sink).await?
         };
         let force = {
-            let mut cache = self.force_session_cache.lock().await;
-            if cache.contains(&retry_jid) {
+            if self.force_session_cache.contains(&retry_jid).await {
                 false
             } else {
-                cache.insert(retry_jid.clone());
+                self.force_session_cache.set(retry_jid.clone(), ()).await;
                 true
             }
         };
@@ -2886,11 +2825,10 @@ impl Client {
         // depois reusa.
         if !injected_from_bundle {
             let force = {
-                let mut cache = self.force_session_cache.lock().await;
-                if cache.contains(&retry_participant) {
+                if self.force_session_cache.contains(&retry_participant).await {
                     false
                 } else {
-                    cache.insert(retry_participant.clone());
+                    self.force_session_cache.set(retry_participant.clone(), ()).await;
                     true
                 }
             };
@@ -3169,11 +3107,10 @@ impl Client {
                 .collect();
             for dev0 in own_device0 {
                 let already = {
-                    let mut cache = self.force_session_cache.lock().await;
-                    if cache.contains(&dev0) {
+                    if self.force_session_cache.contains(&dev0).await {
                         true
                     } else {
-                        cache.insert(dev0.clone());
+                        self.force_session_cache.set(dev0.clone(), ()).await;
                         false
                     }
                 };
@@ -3775,11 +3712,10 @@ impl Client {
                     .collect();
                 for dev0 in own_device0 {
                     let already = {
-                        let mut cache = self.force_session_cache.lock().await;
-                        if cache.contains(&dev0) {
+                        if self.force_session_cache.contains(&dev0).await {
                             true
                         } else {
-                            cache.insert(dev0.clone());
+                            self.force_session_cache.set(dev0.clone(), ()).await;
                             false
                         }
                     };

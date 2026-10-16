@@ -1,5 +1,6 @@
 //! `baileys-socket` — socket WhatsApp (handshake Noise, WebSocket, eventos).
 
+pub mod cache;
 pub mod client;
 pub mod groups;
 pub mod handshake;
@@ -8,6 +9,7 @@ pub mod media;
 pub mod noise;
 pub mod usync;
 
+pub use cache::{CacheStore, TtlCache};
 pub use client::{
     CallInfo, ChatUpdate, Client, ClientError, ClientEvent, ConnectionUpdate, ContactUpsert,
     DebugRetryParams, GroupParticipantsUpdate, GroupUpdate, MediaUpload, MessageKeyExtras,
