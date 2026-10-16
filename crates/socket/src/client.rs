@@ -2975,7 +2975,7 @@ impl Client {
             ..Default::default()
         };
         let msg_id = generate_message_id_v2(Some(&self.me_id()));
-        self.send_one_to_one(jid, message, "text", &msg_id, sink).await
+        self.send_one_to_one(jid, message, "text", &msg_id, sink, &[]).await
     }
 
     /// `relayMessage` 1:1 com `messageId` pré-gerado (paridade Node:
@@ -2987,7 +2987,20 @@ impl Client {
         message_id: &str,
         sink: &WsSink,
     ) -> Result<SendMessageResult, ClientError> {
-        self.send_one_to_one(jid, message, "text", message_id, sink).await
+        self.relay_message_with_attrs(jid, message, message_id, sink, &[]).await
+    }
+
+    /// `relayMessage` 1:1 com `messageId` pré-gerado e atributos extras no
+    /// stanza (`edit`, etc.) — usado por react/edit/forward (paridade Node).
+    pub async fn relay_message_with_attrs(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        message_id: &str,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+    ) -> Result<SendMessageResult, ClientError> {
+        self.send_one_to_one(jid, message, "text", message_id, sink, extra_attrs).await
     }
 
     /// `relayMessage` 1:1 — core do envio E2E para um chat individual.
@@ -3003,6 +3016,7 @@ impl Client {
         msg_type: &str,
         msg_id: &str,
         sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
     ) -> Result<SendMessageResult, ClientError> {
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
         let me_lid = self
@@ -3187,6 +3201,9 @@ impl Client {
                 stanza = stanza.with_attr("peer_recipient_lid", lid);
             }
         }
+        for &(k, v) in extra_attrs {
+            stanza = stanza.with_attr(k, v);
+        }
         let stanza = stanza.with_children(children);
 
         self.send_node(&stanza, sink).await?;
@@ -3328,9 +3345,21 @@ impl Client {
         message: wa::Message,
         sink: &WsSink,
     ) -> Result<SendMessageResult, ClientError> {
+        self.send_media_message_with_attrs(jid, message, sink, &[]).await
+    }
+
+    /// Envia uma mensagem de mídia (imagem/vídeo/áudio/documento) com
+    /// atributos extras no stanza (`edit`, etc.).
+    pub async fn send_media_message_with_attrs(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+    ) -> Result<SendMessageResult, ClientError> {
         // Node `getMessageType` → "text" para mídia (só polls viram "poll").
         let msg_id = generate_message_id_v2(Some(&self.me_id()));
-        self.send_one_to_one(jid, message, "text", &msg_id, sink).await
+        self.send_one_to_one(jid, message, "text", &msg_id, sink, extra_attrs).await
     }
 
     /// Envia uma imagem (JPEG/PNG/WebP/GIF) a partir de bytes: sobe, extrai
@@ -3552,7 +3581,7 @@ impl Client {
             ..Default::default()
         };
         let msg_id = generate_message_id_v2(Some(&self.me_id()));
-        self.send_group(jid, message, &msg_id, sink).await
+        self.send_group(jid, message, &msg_id, sink, &[]).await
     }
 
     /// Envia uma mensagem cifrada por sender-key para um grupo (conteúdo
@@ -3563,8 +3592,20 @@ impl Client {
         message: wa::Message,
         sink: &WsSink,
     ) -> Result<SendMessageResult, ClientError> {
+        self.send_group_message_with_attrs(jid, message, sink, &[]).await
+    }
+
+    /// Envia uma mensagem cifrada por sender-key para um grupo com atributos
+    /// extras no stanza (`edit`, etc.).
+    pub async fn send_group_message_with_attrs(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+    ) -> Result<SendMessageResult, ClientError> {
         let msg_id = generate_message_id_v2(Some(&self.me_id()));
-        self.send_group(jid, message, &msg_id, sink).await
+        self.send_group(jid, message, &msg_id, sink, extra_attrs).await
     }
 
     /// `relayMessage` para grupos com `messageId` pré-gerado (paridade Node).
@@ -3575,7 +3616,20 @@ impl Client {
         message_id: &str,
         sink: &WsSink,
     ) -> Result<SendMessageResult, ClientError> {
-        self.send_group(jid, message, message_id, sink).await
+        self.relay_group_message_with_attrs(jid, message, message_id, sink, &[]).await
+    }
+
+    /// `relayMessage` para grupos com `messageId` pré-gerado e atributos
+    /// extras no stanza (`edit`, etc.) — usado por react/edit/forward.
+    pub async fn relay_group_message_with_attrs(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        message_id: &str,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+    ) -> Result<SendMessageResult, ClientError> {
+        self.send_group(jid, message, message_id, sink, extra_attrs).await
     }
 
     /// `relayMessage` para grupos — port do bloco `isGroup` do Node.
@@ -3589,6 +3643,7 @@ impl Client {
         message: wa::Message,
         msg_id: &str,
         sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
     ) -> Result<SendMessageResult, ClientError> {
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
         let me_lid = self
@@ -3765,7 +3820,7 @@ impl Client {
             }
         }
 
-        let stanza = BinaryNode::new("message")
+        let mut stanza = BinaryNode::new("message")
             .with_attr("id", msg_id)
             .with_attr("type", get_message_type(&message))
             .with_attr("to", jid)
@@ -3774,8 +3829,11 @@ impl Client {
                 meta.addressing_mode
                     .as_deref()
                     .unwrap_or("pn"),
-            )
-            .with_children(children);
+            );
+        for &(k, v) in extra_attrs {
+            stanza = stanza.with_attr(k, v);
+        }
+        let stanza = stanza.with_children(children);
 
         tracing::debug!(
             msg_id,
