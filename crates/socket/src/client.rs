@@ -456,6 +456,10 @@ pub struct Client {
     devices_cache: TtlCache<Vec<(String, u32, String)>>,
     /// `onWhatsapp` — existência no WhatsApp por JID.
     on_whatsapp_cache: TtlCache<bool>,
+    /// `sender-key-memory` — mapa `senderId → true` por grupo, port do
+    /// `authState.keys.set({ 'sender-key-memory': { [jid]: senderKeyMap } })`
+    /// do Node (memória da distribuição de sender key por grupo).
+    sender_key_memory: TtlCache<HashMap<String, bool>>,
     /// `profilePicture` — URLs de foto de perfil por JID.
     profile_picture_cache: TtlCache<String>,
     /// `groupMetaCache` — metadados de grupo por JID.
@@ -496,6 +500,7 @@ impl Client {
             lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             devices_cache: TtlCache::new(Duration::from_secs(1000), 2000),
             on_whatsapp_cache: TtlCache::new(Duration::from_secs(7200), 1000),
+            sender_key_memory: TtlCache::new(Duration::from_secs(86400), 2000),
             profile_picture_cache: TtlCache::new(Duration::from_secs(7200), 1000),
             group_meta_cache: TtlCache::new(Duration::from_secs(3600), 1000),
             save_message_fn: Mutex::new(None),
@@ -3084,7 +3089,7 @@ impl Client {
         if !device_jids.iter().any(|d| d == &me_ref) {
             device_jids.push(me_ref.clone());
         }
-        let mut devices = self.get_usync_devices(&device_jids, sink).await?;
+        let mut devices = self.get_usync_devices(&device_jids, sink, false).await?;
 
         let my_user = jid_user(&me_id).unwrap_or_default();
         let my_lid_user = jid_user(&me_lid).unwrap_or_default();
@@ -3683,17 +3688,26 @@ impl Client {
             .map(|j| j.unwrap())
             .collect();
 
-        let mut devices = self.get_usync_devices(&participant_jids, sink).await?;
+        let mut devices = self.get_usync_devices(&participant_jids, sink, true).await?;
 
-        // Garante nosso device 0 (primary) no fanout, como o Node faz.
+        // Garante nosso device 0 (primary) no fanout, como o Node faz:
+        // apenas via LID (`{user: jlidUser, device: 0, jid: jidNormalizedUser(meLid)}`).
+        // O push por PN (`@s.whatsapp.net`) fazia o Android de terceiros exibir o
+        // JID bruto `número:device` em vez de resolver a sender key do autor.
         let me_lid_user = jid_user(&me_lid).unwrap_or_default();
         let me_id_user = jid_user(&me_id).unwrap_or_default();
         let has_me_phone = devices
             .iter()
-            .any(|(u, d, _)| (u == &me_lid_user || u == &me_id_user) && *d == 0);
+            .any(|(u, d, _)| u == &me_lid_user && *d == 0);
         if !has_me_phone {
-            devices.push((me_lid_user.clone(), 0, baileys_core::jid_normalized_user(&me_lid)));
-            devices.push((me_id_user.clone(), 0, baileys_core::jid_normalized_user(&me_id)));
+            // Phone via LID: quando `me.lid` está vazio (`me_lid` caiu para PN),
+            // forçamos `{user}@lid` em vez de cair em `@s.whatsapp.net`.
+            let phone_lid_jid = if baileys_core::is_lid_user(&me_lid) {
+                baileys_core::jid_normalized_user(&me_lid)
+            } else {
+                format!("{me_lid_user}@lid")
+            };
+            devices.push((me_lid_user.clone(), 0, phone_lid_jid));
         }
         tracing::debug!(?devices, "fanout grupo após correção de device 0");
 
@@ -3711,6 +3725,10 @@ impl Client {
         };
 
         let mut sender_key_jids: Vec<String> = Vec::new();
+        // `sender-key-memory` do Node: `senderKeyMap[senderId] = true` — reuso
+        // da distribuição de sender key já conhecida por grupo (anti-ban).
+        let mut sender_key_map: HashMap<String, bool> =
+            self.sender_key_memory.get(jid).await.unwrap_or_default();
         for (user, device, dev_jid) in &devices {
             let server = if baileys_core::is_lid_user(dev_jid) {
                 "lid"
@@ -3723,7 +3741,11 @@ impl Client {
             } else {
                 format!("{user}:{device}@{server}")
             };
+            sender_key_map.insert(sender_id.clone(), true);
             sender_key_jids.push(sender_id);
+        }
+        if !sender_key_map.is_empty() {
+            self.sender_key_memory.set(jid.to_string(), sender_key_map).await;
         }
         tracing::debug!(?sender_key_jids, "fanout grupo: sender_key_jids");
         tracing::info!(
@@ -3791,12 +3813,14 @@ impl Client {
         if !participants.is_empty() {
             children.push(BinaryNode::new("participants").with_children(participants));
         }
-        children.push(
-            BinaryNode::new("enc")
-                .with_attr("v", "2")
-                .with_attr("type", "skmsg")
-                .with_bytes(enc.ciphertext),
-        );
+        // `extraAttrs` do Node: `mediatype` no `enc` skmsg para mensagens de mídia.
+        let mut skmsg_enc = BinaryNode::new("enc")
+            .with_attr("v", "2")
+            .with_attr("type", "skmsg");
+        if let Some(mediatype) = get_media_type(&message) {
+            skmsg_enc = skmsg_enc.with_attr("mediatype", mediatype);
+        }
+        children.push(skmsg_enc.with_bytes(enc.ciphertext));
         if should_include_device_identity {
             if let Some(account) = self.store.creds().account {
                 if let Some(encoded) = crate::handshake::encode_signed_device_identity(&account, true) {
@@ -3807,7 +3831,7 @@ impl Client {
 
         let stanza = BinaryNode::new("message")
             .with_attr("id", msg_id)
-            .with_attr("type", "text")
+            .with_attr("type", get_message_type(&message))
             .with_attr("to", jid)
             .with_attr(
                 "addressing_mode",
@@ -3816,6 +3840,17 @@ impl Client {
                     .unwrap_or("pn"),
             )
             .with_children(children);
+
+        tracing::debug!(
+            msg_id,
+            group = jid,
+            stanza_type = %stanza.attr("type").unwrap_or_default(),
+            to = %stanza.attr("to").unwrap_or_default(),
+            addressing_mode = %stanza.attr("addressing_mode").unwrap_or_default(),
+            participants = sender_key_jids.len(),
+            ?sender_key_jids,
+            "stanza de grupo preparado"
+        );
 
         self.send_node(&stanza, sink).await?;
 
@@ -3910,10 +3945,15 @@ impl Client {
     /// de JIDs via USync `devices` (contexto `message`), espelhando
     /// `getUSyncDevices` + `extractDeviceJids` de `messages-send.js`, com
     /// cache TTL (`devicesCache`) para evitar consultas repetidas (anti-ban).
+    ///
+    /// `group_devices` espelha o 4º argumento `groupDevices` do Node: prefixa
+    /// a chave de cache com `group-` (resolvendo a LID), para que o fanout de
+    /// grupo não colida com o cache de devices 1:1 do mesmo usuário.
     pub async fn get_usync_devices(
         &self,
         jids: &[String],
         sink: &WsSink,
+        group_devices: bool,
     ) -> Result<Vec<(String, u32, String)>, ClientError> {
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
         let me_lid = self
@@ -3949,9 +3989,12 @@ impl Client {
         let mut users: Vec<crate::usync::USyncUser> = Vec::new();
         let mut to_fetch: Vec<String> = Vec::new();
         for normalized in &normalized_jids {
+            // Chave de cache: `group-{lid}` quando é fanout de grupo, `{jid}`
+            // quando é 1:1 — mesmo esquema do Node (`labelLid`).
+            let cache_key = self.devices_cache_key(normalized, group_devices, sink).await;
             // Cache por JID (chave = normalized; devices incluem os nossos e
             // os alheios, então o cache por JID é seguro como no Node).
-            if let Some(devices) = self.devices_cache.get(normalized).await {
+            if let Some(devices) = self.devices_cache.get(&cache_key).await {
                 for d in &devices {
                     let key = (d.0.clone(), d.1, d.2.clone());
                     if seen.insert(key.clone()) {
@@ -3994,9 +4037,9 @@ impl Client {
                     }
                 }
             }
-            // Armazena no cache por JID normalizado (devices daquele usuário).
+            // Armazena no cache (chave `group-{lid}` para grupo, `{jid}` 1:1).
             if !jid_devices.is_empty() {
-                let cache_key = baileys_core::jid_normalized_user(&r.id);
+                let cache_key = self.devices_cache_key(&r.id, group_devices, sink).await;
                 if !cache_key.is_empty() {
                     self.devices_cache.set(cache_key, jid_devices).await;
                 }
@@ -4004,6 +4047,29 @@ impl Client {
         }
 
         Ok(out)
+    }
+
+    /// Chave do `devicesCache` — port do `labelLid` do Node:
+    /// `group-{lid}` para fanout de grupo, senão `{jid}` normalizado.
+    async fn devices_cache_key(&self, jid: &str, group_devices: bool, sink: &WsSink) -> String {
+        let normalized = baileys_core::jid_normalized_user(jid);
+        if normalized.is_empty() {
+            return normalized;
+        }
+        if !group_devices {
+            return normalized;
+        }
+        if baileys_core::is_lid_user(&normalized) {
+            return format!("group-{normalized}");
+        }
+        // Node: resolve `getLid(jid)` e prefixa `group-{lid}`.
+        if let Some(lid) = self.get_lid(&normalized, sink).await {
+            let lid_user = baileys_core::jid_normalized_user(&lid);
+            if !lid_user.is_empty() {
+                return format!("group-{lid_user}");
+            }
+        }
+        format!("group-{normalized}")
     }
 
     /// `assertSessions` — busca chaves E2E do servidor se a sessão não existe
@@ -4541,6 +4607,56 @@ fn get_status_from_receipt_type(r#type: Option<&str>) -> Option<i32> {
         Some("read") | Some("read-self") => Some(wa::web_message_info::Status::Read as i32),
         None => Some(wa::web_message_info::Status::DeliveryAck as i32),
         _ => None,
+    }
+}
+
+/// `getMessageType` (port de `messages-send.js` do Hineken):
+/// `poll` para criação de enquete, senão `text`.
+fn get_message_type(message: &wa::Message) -> &'static str {
+    if message.poll_creation_message.is_some()
+        || message.poll_creation_message_v2.is_some()
+        || message.poll_creation_message_v3.is_some()
+    {
+        return "poll";
+    }
+    "text"
+}
+
+/// `getMediaType` (port de `messages-send.js` do Hineken) — usada no
+/// `extraAttrs['mediatype']` do `enc` skmsg para mensagens de mídia.
+fn get_media_type(message: &wa::Message) -> Option<&'static str> {
+    if message.image_message.is_some() {
+        Some("image")
+    } else if let Some(v) = &message.video_message {
+        Some(if v.gif_playback.unwrap_or(false) { "gif" } else { "video" })
+    } else if let Some(a) = &message.audio_message {
+        Some(if a.ptt.unwrap_or(false) { "ptt" } else { "audio" })
+    } else if message.contact_message.is_some() {
+        Some("vcard")
+    } else if message.document_message.is_some() {
+        Some("document")
+    } else if message.contacts_array_message.is_some() {
+        Some("contact_array")
+    } else if message.live_location_message.is_some() {
+        Some("livelocation")
+    } else if message.sticker_message.is_some() {
+        Some("sticker")
+    } else if message.list_message.is_some() {
+        Some("list")
+    } else if message.list_response_message.is_some() {
+        Some("list_response")
+    } else if message.buttons_response_message.is_some() {
+        Some("buttons_response")
+    } else if message.order_message.is_some() {
+        Some("order")
+    } else if message.product_message.is_some() {
+        Some("product")
+    } else if message.interactive_response_message.is_some() {
+        Some("native_flow_response")
+    } else if message.group_invite_message.is_some() {
+        Some("url")
+    } else {
+        None
     }
 }
 
