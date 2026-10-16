@@ -4063,7 +4063,7 @@ impl Client {
             return format!("group-{normalized}");
         }
         // Node: resolve `getLid(jid)` e prefixa `group-{lid}`.
-        if let Some(lid) = self.get_lid(&normalized, sink).await {
+        if let Ok(Some(lid)) = self.get_lid(&normalized, sink).await {
             let lid_user = baileys_core::jid_normalized_user(&lid);
             if !lid_user.is_empty() {
                 return format!("group-{lid_user}");
