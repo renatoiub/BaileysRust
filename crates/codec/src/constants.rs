@@ -1299,18 +1299,28 @@ pub static DOUBLE_BYTE_TOKENS: &[&[&str]] = &[
     ],
 ];
 
-/// Mapa de token → (dict opcional, índice), construído em runtime.
-pub fn token_map() -> std::collections::HashMap<String, (Option<usize>, usize)> {
+/// Mapa de token → (dict opcional, índice), construído uma única vez.
+pub static TOKEN_MAP: std::sync::LazyLock<
+    std::collections::HashMap<&'static str, (Option<usize>, usize)>,
+> = std::sync::LazyLock::new(|| {
     let mut map = std::collections::HashMap::new();
     for (i, token) in SINGLE_BYTE_TOKENS.iter().enumerate() {
-        map.insert((*token).to_string(), (None, i));
+        map.insert(*token, (None, i));
     }
     for (i, dict) in DOUBLE_BYTE_TOKENS.iter().enumerate() {
         for (j, token) in dict.iter().enumerate() {
-            map.insert((*token).to_string(), (Some(i), j));
+            map.insert(*token, (Some(i), j));
         }
     }
     map
+});
+
+/// Versão owned (usada por testes/consumidores que precisam de `String`).
+pub fn token_map() -> std::collections::HashMap<String, (Option<usize>, usize)> {
+    TOKEN_MAP
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), *v))
+        .collect()
 }
 
 #[cfg(test)]

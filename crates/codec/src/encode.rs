@@ -4,16 +4,16 @@ use std::collections::HashMap;
 
 use baileys_core::{jid_decode, BinaryContent, BinaryNode};
 
-use crate::constants::{tags, token_map};
+use crate::constants::{tags, TOKEN_MAP};
 
 pub struct EncodeOptions {
-    pub token_map: HashMap<String, (Option<usize>, usize)>,
+    pub token_map: HashMap<&'static str, (Option<usize>, usize)>,
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
-            token_map: token_map(),
+            token_map: TOKEN_MAP.clone(),
         }
     }
 }

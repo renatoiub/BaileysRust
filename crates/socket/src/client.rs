@@ -163,9 +163,12 @@ pub struct MessageReaction {
 }
 
 /// Histórico sincronizado (espelha `messaging-history.set`).
+///
+/// `chats` foi removido do payload: as mesmas mensagens já vêm em `messages`
+/// (o consumidor só usa `messages`), e carregar `Conversation` duplicava toda
+/// a memória do history sync.
 #[derive(Debug, Clone, Default)]
 pub struct MessagingHistorySet {
-    pub chats: Vec<wa::Conversation>,
     pub contacts: Vec<serde_json::Value>,
     pub messages: Vec<wa::WebMessageInfo>,
     pub is_latest: bool,
@@ -355,7 +358,12 @@ pub struct Client {
     qr_rotation: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Cache de envio: `msg_id` → `(destino, Message codificado)` para o
     /// reenvio em `<receipt type="retry">` (port de `sendMessageCache`).
+    /// Limitado a `SEND_CACHE_MAX` entradas (FIFO): o retry cai no store Redis
+    /// do app (`load_message_fn`) quando o cache erra, então evictar é seguro.
     send_cache: Mutex<HashMap<String, (String, Vec<u8>)>>,
+    /// Ordem FIFO de inserção no `send_cache` (msg_id) para evicção da mais
+    /// antiga quando o limite é atingido.
+    send_cache_order: Mutex<Vec<String>>,
     /// JIDs cuja sessão E2E já foi forçada uma vez (port de `caches.forceSession`).
     force_session_cache: TtlCache<()>,
     /// Mutex de retry (port de `retryMutex` do Node) — serializa o
@@ -394,7 +402,7 @@ impl Client {
             sqlite.save_creds(&creds)?;
         }
         let store = Arc::new(SqliteSignalStore::new(sqlite.clone())?);
-        let (events, _) = tokio::sync::broadcast::channel(512);
+        let (events, _) = tokio::sync::broadcast::channel(64);
 
         Ok(Self {
             store,
@@ -408,6 +416,7 @@ impl Client {
             last_close_code: AtomicI32::new(0),
             qr_rotation: Mutex::new(None),
             send_cache: Mutex::new(HashMap::new()),
+            send_cache_order: Mutex::new(Vec::new()),
             force_session_cache: TtlCache::new(Duration::from_secs(86400), 2000),
             retry_mutex: Mutex::new(()),
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000),
@@ -501,6 +510,28 @@ impl Client {
             .set_backend(&format!("cache:instance:{instance_key}:placeholder"), Some(backend.clone()));
         self.force_session_cache
             .set_backend(&format!("cache:instance:{instance_key}:forcesession"), Some(backend));
+    }
+
+    /// Insere no `send_cache` com limite FIFO (`SEND_CACHE_MAX`). Remove a
+    /// entrada mais antiga quando o limite é atingido — o retry cai no store
+    /// Redis do app (`load_message_fn`), então a evicção é segura.
+    async fn cache_send(&self, msg_id: String, jid: String, encoded: Vec<u8>) {
+        const SEND_CACHE_MAX: usize = 500;
+        let mut cache = self.send_cache.lock().await;
+        if cache.len() >= SEND_CACHE_MAX {
+            let mut order = self.send_cache_order.lock().await;
+            while cache.len() >= SEND_CACHE_MAX {
+                let Some(oldest) = order.first().cloned() else {
+                    break;
+                };
+                order.remove(0);
+                cache.remove(&oldest);
+            }
+        }
+        if cache.insert(msg_id.clone(), (jid, encoded)).is_none() {
+            // Só registra a ordem em inserção nova (não em substituição).
+            self.send_cache_order.lock().await.push(msg_id);
+        }
     }
 
     /// Criptografa uma mensagem E2E para um JID (usado pelo CallManager).
@@ -1966,14 +1997,13 @@ impl Client {
                 }
 
                 if let Some(h) = history {
-                    let chats: Vec<wa::Conversation> = h.conversations;
-                    let messages: Vec<wa::WebMessageInfo> = chats
-                        .iter()
-                        .flat_map(|c| {
-                            c.messages
-                                .iter()
-                                .filter_map(|m| m.message.clone())
-                        })
+                    // `messages` extraído direto (sem reter `Conversation`
+                    // completo: o consumidor só usa `data.messages`).
+                    let messages: Vec<wa::WebMessageInfo> = h
+                        .conversations
+                        .into_iter()
+                        .flat_map(|c| c.messages)
+                        .filter_map(|m| m.message)
                         .collect();
                     let contacts: Vec<serde_json::Value> = h
                         .pushnames
@@ -1987,7 +2017,6 @@ impl Client {
                         .collect();
                     let _ = self.events.send(ClientEvent::MessagingHistorySet {
                         data: MessagingHistorySet {
-                            chats,
                             contacts,
                             messages,
                             is_latest,
@@ -2722,10 +2751,7 @@ impl Client {
             if let Some(load) = load {
                 match load(msg_id.clone(), target_jid.clone()).await {
                     Some(bytes) if !bytes.is_empty() => {
-                        self.send_cache
-                            .lock()
-                            .await
-                            .insert(msg_id.clone(), (target_jid.clone(), bytes.clone()));
+                        self.cache_send(msg_id.clone(), target_jid.clone(), bytes.clone()).await;
                         cached_bytes = bytes;
                         tracing::debug!(msg_id, target_jid, "mensagem recuperada do store para retry");
                     }
@@ -3209,10 +3235,7 @@ impl Client {
         self.send_node(&stanza, sink).await?;
 
         // Cache para reenvio em retry.
-        self.send_cache
-            .lock()
-            .await
-            .insert(msg_id.to_string(), (jid.to_string(), message.encode_to_vec()));
+        self.cache_send(msg_id.to_string(), jid.to_string(), message.encode_to_vec()).await;
 
         // Persiste a mensagem enviada no store do app (fire-and-forget) para
         // reenvio em retry após restart do processo.
@@ -3784,10 +3807,11 @@ impl Client {
                 }
             }
 
+            let sk_msg_bytes = sender_key_msg.encode_to_vec();
             for sender_id in &sender_key_jids {
                 let dest = convert_lid_device(sender_id, None, &me_id, &me_lid);
                 let sk_enc = repo
-                    .encrypt_message(&dest, &write_random_pad_max16(&sender_key_msg.encode_to_vec()))?;
+                    .encrypt_message(&dest, &write_random_pad_max16(&sk_msg_bytes))?;
                 if sk_enc.r#type == "pkmsg" {
                     should_include_device_identity = true;
                 }
@@ -3849,10 +3873,7 @@ impl Client {
         self.send_node(&stanza, sink).await?;
 
         // Cache para reenvio em retry.
-        self.send_cache
-            .lock()
-            .await
-            .insert(msg_id.to_string(), (jid.to_string(), message.encode_to_vec()));
+        self.cache_send(msg_id.to_string(), jid.to_string(), message.encode_to_vec()).await;
 
         // Persiste a mensagem enviada no store do app (fire-and-forget).
         let encoded = message.encode_to_vec();
