@@ -99,6 +99,55 @@ impl SqliteSignalStore {
         self.creds.read().expect("creds lock").clone()
     }
 
+    /// Lê uma chave genérica do `SignalKeyStore` (`authState.keys.get(type, ids)`),
+    /// ex.: `contacts-tc-token`. Extensão (Redis) primeiro, miss cai no SQLite
+    /// (`read_string`/`read_raw`) e copia de volta.
+    pub fn load_generic(&self, category: &str, id: &str) -> Option<String> {
+        let ext = self.extension();
+        if let Some(ext) = ext {
+            if let Some(raw) = ext.load(category, id) {
+                return Some(raw);
+            }
+        }
+        let key = format!("{category}-{id}");
+        self.sqlite
+            .read_string(&key)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                self.sqlite
+                    .read_raw(&key)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+            })
+    }
+
+    /// Grava uma chave genérica do `SignalKeyStore` (`authState.keys.set`).
+    /// Extensão primeiro; se não aceitar, cai no SQLite.
+    pub fn store_generic(&self, category: &str, id: &str, json: &str) {
+        let ext = self.extension();
+        if let Some(ext) = ext {
+            if ext.store(category, id, json) {
+                return;
+            }
+        }
+        let key = format!("{category}-{id}");
+        let _ = self.sqlite.write_string(&key, json);
+    }
+
+    /// Remove uma chave genérica do `SignalKeyStore` (`authState.keys.remove`).
+    pub fn remove_generic(&self, category: &str, id: &str) {
+        let ext = self.extension();
+        if let Some(ext) = ext {
+            if ext.remove(category, id) {
+                return;
+            }
+        }
+        let key = format!("{category}-{id}");
+        let _ = self.sqlite.remove(&key);
+    }
+
     fn sqlite_err(e: impl std::fmt::Display) -> baileys_signal::error::SignalError {
         baileys_signal::error::SignalError::Store(e.to_string())
     }

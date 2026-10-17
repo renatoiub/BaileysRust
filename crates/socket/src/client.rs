@@ -276,6 +276,14 @@ pub struct SendMessageResult {
     pub message_id: String,
 }
 
+/// Participante-alvo de um relay (retry) — port do `{ jid, count }` do Node
+/// (`MessageRelayOptions.participant`).
+#[derive(Debug, Clone)]
+pub struct RelayParticipant {
+    pub jid: String,
+    pub count: u32,
+}
+
 /// Parâmetros configuráveis do retry manual (`/manager/retry`).
 ///
 /// Espelha o `sendRetryRequest` do Hineken, mas com todos os campos do nó
@@ -2591,9 +2599,6 @@ impl Client {
         let recipient = node.attr("recipient").map(String::from);
         let msg_id = node.attr("id").unwrap_or_default().to_string();
 
-        // Ack primeiro (espelha `handleReceipt`/`sendMessageAck` do Node).
-        self.send_message_ack(node, sink).await?;
-
         tracing::info!(
             receipt_type,
             from,
@@ -2696,11 +2701,35 @@ impl Client {
         }
 
         if receipt_type != "retry" {
+            // Node manda o ack no `finally` — para não-retry, sem retry
+            // abaixo, o ack sai aqui (mesmo efeito do `finally` do Node).
+            self.send_message_ack(node, sink).await?;
             return Ok(());
         }
         if msg_id.is_empty() {
+            // Sem id não há retry a processar — ack e sai.
+            self.send_message_ack(node, sink).await?;
             return Ok(());
         }
+
+        // Node manda o ack no `finally` (depois do processamento do retry, ou
+        // mesmo quando o retry falha/no-op). Processa o retry e garante o ack
+        // ao final de qualquer caminho.
+        if let Err(e) = self.process_retry(node, sink).await {
+            tracing::warn!(error = %e, msg_id, "retry: processamento falhou (ack enviado mesmo assim)");
+        }
+        self.send_message_ack(node, sink).await?;
+        Ok(())
+    }
+
+    /// Port de `sendMessagesAgain` + `relayMessage` do Node para `type=retry`.
+    async fn process_retry(&self, node: &BinaryNode, sink: &WsSink) -> Result<(), ClientError> {
+        let receipt_type = node.attr("type").unwrap_or_default().to_string();
+        let from = node.attr("from").unwrap_or_default().to_string();
+        let participant = node.attr("participant").map(String::from);
+        let recipient = node.attr("recipient").map(String::from);
+        let msg_id = node.attr("id").unwrap_or_default().to_string();
+        let _ = receipt_type;
 
         // Serializa o processamento de retry (port do `retryMutex` do Node).
         let _retry_guard = self.retry_mutex.lock().await;
@@ -2770,7 +2799,13 @@ impl Client {
         let lid = if baileys_core::is_jid_group(&target_jid) {
             None
         } else {
-            self.get_lid(&target_jid, sink).await?
+            match self.get_lid(&target_jid, sink).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(error = %e, msg_id, target_jid, "retry: falha ao resolver LID");
+                    return Ok(());
+                }
+            }
         };
 
         // Tenta extrair e injetar a sessão E2E do bundle `<keys>` do retry
@@ -2868,6 +2903,11 @@ impl Client {
 
         let is_group = baileys_core::is_jid_group(&target_jid);
         if is_group {
+            // Node `messages-recv.ts:898`: antes do reenvio em grupo, apaga a
+            // `sender-key-memory` do grupo para forçar nova distribuição da
+            // sender key (senão o peer reusa uma chave antiga e não decripta).
+            self.sender_key_memory.remove(&target_jid).await;
+
             // Grupo: re-cifra com sender-key (`skmsg`) e inclui a distribuição
             // da sender-key como `pkmsg` 1:1 para o participante pedinte.
             let enc = repo.encrypt_group_message(
@@ -2942,7 +2982,12 @@ impl Client {
             }
             .encode_to_vec()
         } else {
-            cached_bytes.clone()
+            // Node `messages-recv.ts:943`: `delete msg.messageContextInfo`
+            // antes do reenvio PV — sem isso o contextInfo original (segredo
+            // de reporting) é re-injetado no payload do retry.
+            let mut cached_msg = wa::Message::decode(cached_bytes.as_slice()).unwrap_or_default();
+            cached_msg.message_context_info = None;
+            cached_msg.encode_to_vec()
         };
 
         let dest = convert_lid_device(&retry_participant, lid.as_deref(), &me_id, &me_lid);
@@ -3001,7 +3046,7 @@ impl Client {
             ..Default::default()
         };
         let msg_id = generate_message_id_v2(Some(&self.me_id()));
-        self.send_one_to_one(jid, message, "text", &msg_id, sink, &[]).await
+        self.send_one_to_one(jid, message, "text", &msg_id, sink, &[], None, false).await
     }
 
     /// `relayMessage` 1:1 com `messageId` pré-gerado (paridade Node:
@@ -3026,7 +3071,26 @@ impl Client {
         sink: &WsSink,
         extra_attrs: &[(&str, &str)],
     ) -> Result<SendMessageResult, ClientError> {
-        self.send_one_to_one(jid, message, "text", message_id, sink, extra_attrs).await
+        self.send_one_to_one(jid, message, "text", message_id, sink, extra_attrs, None, false).await
+    }
+
+    /// `relayMessage` de retry para 1:1 — `{ messageId, isretry: true, participant }`.
+    ///
+    /// Port do bloco `participant && !isGroup && !isStatus && !isNewsletter`
+    /// do Node (`messages-send.ts` linhas 592–634): cifra SÓ para o
+    /// `participant` pedinte (com `deviceSentMessage` se for device nosso),
+    /// `device_fanout=false`, `enc` direto (sem `<participants>`) e
+    /// `to = participant.jid` (+ `recipient` quando é device nosso).
+    pub async fn relay_message_retry(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        message_id: &str,
+        participant: &RelayParticipant,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+    ) -> Result<SendMessageResult, ClientError> {
+        self.send_one_to_one(jid, message, "text", message_id, sink, extra_attrs, Some(participant), true).await
     }
 
     /// `relayMessage` 1:1 — core do envio E2E para um chat individual.
@@ -3043,6 +3107,8 @@ impl Client {
         msg_id: &str,
         sink: &WsSink,
         extra_attrs: &[(&str, &str)],
+        participant: Option<&RelayParticipant>,
+        _is_retry: bool,
     ) -> Result<SendMessageResult, ClientError> {
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
         let me_lid = self
@@ -3052,6 +3118,84 @@ impl Client {
             .clone()
             .and_then(|m| m.lid)
             .unwrap_or_else(|| me_id.clone());
+
+        let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
+
+        // `participant && !isGroup && !isStatus && !isNewsletter` (Node linhas
+        // 592–634): retry 1:1 — envia SÓ para o participant pedinte.
+        if let Some(participant) = participant {
+            // LID do participant (endereçamento da sessão).
+            let lid = self.get_lid(&participant.jid, sink).await?;
+
+            // `isMe`: device nosso? então `deviceSentMessage`.
+            let is_participant_lid = baileys_core::is_lid_user(&participant.jid);
+            let is_me = are_jids_same_user(
+                &participant.jid,
+                if is_participant_lid { &me_lid } else { &me_id },
+            ) || are_jids_same_user(&participant.jid, &me_id)
+                || are_jids_same_user(&participant.jid, &me_lid);
+
+            let message_to_send = if is_me {
+                wa::Message {
+                    device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                        destination_jid: Some(baileys_core::jid_normalized_user(jid)),
+                        message: Some(Box::new(message.clone())),
+                        phash: None,
+                    })),
+                    ..Default::default()
+                }
+            } else {
+                message.clone()
+            };
+
+            let dest = convert_lid_device(&participant.jid, lid.as_deref(), &me_id, &me_lid);
+            let enc = repo.encrypt_message(
+                &dest,
+                &write_random_pad_max16(&message_to_send.encode_to_vec()),
+            )?;
+
+            let count_str = participant.count.max(1).to_string();
+            let mut enc_attrs: Vec<(&str, &str)> = vec![
+                ("v", "2"),
+                ("type", &enc.r#type),
+                ("count", &count_str),
+            ];
+            for (k, v) in extra_attrs {
+                enc_attrs.push((k, v));
+            }
+            let mut enc_node = BinaryNode::new("enc").with_bytes(enc.ciphertext);
+            for (k, v) in enc_attrs {
+                enc_node = enc_node.with_attr(k, v);
+            }
+
+            let mut children = vec![enc_node];
+            if enc.r#type == "pkmsg" {
+                if let Some(account) = self.store.creds().account {
+                    if let Some(encoded) = crate::handshake::encode_signed_device_identity(&account, true) {
+                        children.push(BinaryNode::new("device-identity").with_bytes(encoded));
+                    }
+                }
+            }
+
+            // Node linhas 857–865: `to = participant.jid`; se device nosso,
+            // `recipient = destinationJid`. `device_fanout=false`.
+            let mut stanza = BinaryNode::new("message")
+                .with_attr("id", msg_id)
+                .with_attr("to", &participant.jid)
+                .with_attr("device_fanout", "false");
+            if is_me {
+                stanza = stanza.with_attr("recipient", baileys_core::jid_normalized_user(jid));
+            }
+            stanza = stanza.with_attr("type", msg_type);
+            for &(k, v) in extra_attrs {
+                stanza = stanza.with_attr(k, v);
+            }
+            let stanza = stanza.with_children(children);
+
+            self.send_node(&stanza, sink).await?;
+            tracing::debug!(msg_id, jid, participant = %participant.jid, "mensagem 1:1 reenviada para participante (retry)");
+            return Ok(SendMessageResult { message_id: msg_id.to_string() });
+        }
 
         // LID do destinatário (para o `peer_recipient_lid` e endereçamento).
         let lid = self.get_lid(jid, sink).await?;
@@ -3218,6 +3362,55 @@ impl Client {
             }
         }
 
+        // tctoken / cstoken (Node `messages-send.ts` linhas 881–947): em 1:1
+        // (sem retry/status/newsletter), resolve o token de contato confiável
+        // (`contacts-tc-token`) por LID e anexa ao stanza. Sem `tctoken`, o
+        // WhatsApp pode não confirmar a entrega em alguns cenários 1:1.
+        let tc_token_jid = lid.as_deref().unwrap_or(jid);
+        let mut tc_token_buffer: Option<Vec<u8>> = None;
+        let mut tc_token_expired = true;
+        if let Some(raw) = self.store.load_generic("contacts-tc-token", tc_token_jid) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(token_obj) = value.get("token").or_else(|| value.as_object().and_then(|m| m.get("token"))) {
+                    // token pode vir como `{"type":"Buffer","data":"..."}` ou
+                    // array de bytes (reviver do BufferJSON).
+                    if let Some(bytes) = buffer_value_bytes(token_obj) {
+                        tc_token_buffer = Some(bytes);
+                    }
+                }
+                if let Some(ts) = value.get("timestamp").and_then(|v| match v {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                }) {
+                    tc_token_expired = is_tc_token_expired(Some(&ts));
+                }
+            }
+        }
+        if tc_token_buffer.is_some() && tc_token_expired {
+            tracing::debug!(jid, "tctoken expirado, limpando");
+            tc_token_buffer = None;
+            self.store.remove_generic("contacts-tc-token", tc_token_jid);
+        }
+
+        // `cstoken` quando não há `tctoken` e `nctSalt` existe.
+        if tc_token_buffer.is_none() {
+            let creds = self.store.creds();
+            if let Some(salt) = creds.nct_salt.as_ref() {
+                let salt_bytes = decode_buffer(salt);
+                if !salt_bytes.is_empty() {
+                    let recipient_lid = lid.as_deref().unwrap_or(jid);
+                    let cs_token = compute_cs_token(&salt_bytes, recipient_lid);
+                    children.push(BinaryNode::new("cstoken").with_bytes(cs_token));
+                }
+            }
+        }
+
+        // `tctoken` quando há token válido.
+        if let Some(token) = tc_token_buffer {
+            children.push(BinaryNode::new("tctoken").with_bytes(token));
+        }
+
         let mut stanza = BinaryNode::new("message")
             .with_attr("id", msg_id)
             .with_attr("type", msg_type)
@@ -3231,6 +3424,11 @@ impl Client {
             stanza = stanza.with_attr(k, v);
         }
         let stanza = stanza.with_children(children);
+
+        tracing::info!(
+            stanza = %serde_json::to_string(&node_to_json(&stanza)).unwrap_or_default(),
+            "STANZA_SEND"
+        );
 
         self.send_node(&stanza, sink).await?;
 
@@ -3382,7 +3580,7 @@ impl Client {
     ) -> Result<SendMessageResult, ClientError> {
         // Node `getMessageType` → "text" para mídia (só polls viram "poll").
         let msg_id = generate_message_id_v2(Some(&self.me_id()));
-        self.send_one_to_one(jid, message, "text", &msg_id, sink, extra_attrs).await
+        self.send_one_to_one(jid, message, "text", &msg_id, sink, extra_attrs, None, false).await
     }
 
     /// Envia uma imagem (JPEG/PNG/WebP/GIF) a partir de bytes: sobe, extrai
@@ -3604,7 +3802,7 @@ impl Client {
             ..Default::default()
         };
         let msg_id = generate_message_id_v2(Some(&self.me_id()));
-        self.send_group(jid, message, &msg_id, sink, &[]).await
+        self.send_group(jid, message, &msg_id, sink, &[], None, false).await
     }
 
     /// Envia uma mensagem cifrada por sender-key para um grupo (conteúdo
@@ -3628,7 +3826,7 @@ impl Client {
         extra_attrs: &[(&str, &str)],
     ) -> Result<SendMessageResult, ClientError> {
         let msg_id = generate_message_id_v2(Some(&self.me_id()));
-        self.send_group(jid, message, &msg_id, sink, extra_attrs).await
+        self.send_group(jid, message, &msg_id, sink, extra_attrs, None, false).await
     }
 
     /// `relayMessage` para grupos com `messageId` pré-gerado (paridade Node).
@@ -3652,7 +3850,25 @@ impl Client {
         sink: &WsSink,
         extra_attrs: &[(&str, &str)],
     ) -> Result<SendMessageResult, ClientError> {
-        self.send_group(jid, message, message_id, sink, extra_attrs).await
+        self.send_group(jid, message, message_id, sink, extra_attrs, None, false).await
+    }
+
+    /// `relayMessage` de retry para grupo — `{ messageId, isretry: true, participant }`.
+    ///
+    /// Port do `relayMessage` do Node com `participant` (retry de grupo):
+    /// o reenvio vai SÓ para o `participant` pedinte (senão os demais
+    /// participantes falham na decriptação), com `to = destino` e
+    /// `participant = participant.jid` no stanza.
+    pub async fn relay_group_message_retry(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        message_id: &str,
+        participant: &RelayParticipant,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+    ) -> Result<SendMessageResult, ClientError> {
+        self.send_group(jid, message, message_id, sink, extra_attrs, Some(participant), true).await
     }
 
     /// `relayMessage` para grupos — port do bloco `isGroup` do Node.
@@ -3667,6 +3883,8 @@ impl Client {
         msg_id: &str,
         sink: &WsSink,
         extra_attrs: &[(&str, &str)],
+        participant: Option<&RelayParticipant>,
+        _is_retry: bool,
     ) -> Result<SendMessageResult, ClientError> {
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
         let me_lid = self
@@ -3678,6 +3896,81 @@ impl Client {
             .unwrap_or_else(|| me_id.clone());
 
         let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
+
+        // Metadados do grupo (participantes) — o retry com participant NÃO faz
+        // fanout, mas ainda precisa do `addressing_mode` (Node linha 545).
+        let meta = self.group_metadata(jid, sink).await?;
+        let addressing_mode = meta.addressing_mode.as_deref().unwrap_or("pn");
+
+        // `isGroup && participant` (Node linhas 540–590): retry de grupo — a
+        // mensagem volta como `senderKeyDistributionMessage` cifrada 1:1 para
+        // SOMENTE o participante pedinte (não reenvia para todos).
+        if let Some(participant) = participant {
+            // Node: encryptGroupMessage({ group: destinationJid, data: bytes, meId: meLid }).
+            let enc = repo.encrypt_group_message(
+                jid,
+                &me_lid,
+                &write_random_pad_max16(&message.encode_to_vec()),
+            )?;
+            let message_to_send = wa::Message {
+                sender_key_distribution_message: Some(
+                    wa::message::SenderKeyDistributionMessage {
+                        axolotl_sender_key_distribution_message: Some(
+                            enc.sender_key_distribution_message.clone(),
+                        ),
+                        group_id: Some(jid.to_string()),
+                    },
+                ),
+                ..Default::default()
+            };
+            let lid = self.get_lid(&participant.jid, sink).await?;
+            let dest = convert_lid_device(&participant.jid, lid.as_deref(), &me_id, &me_lid);
+            let enc_1to1 = repo.encrypt_message(
+                &dest,
+                &write_random_pad_max16(&message_to_send.encode_to_vec()),
+            )?;
+
+            let count_str = participant.count.max(1).to_string();
+            let mut enc_attrs: Vec<(&str, &str)> = vec![
+                ("v", "2"),
+                ("type", &enc_1to1.r#type),
+                ("count", &count_str),
+            ];
+            for (k, v) in extra_attrs {
+                enc_attrs.push((k, v));
+            }
+            let mut enc_node = BinaryNode::new("enc").with_bytes(enc_1to1.ciphertext);
+            for (k, v) in enc_attrs {
+                enc_node = enc_node.with_attr(k, v);
+            }
+
+            let mut children = vec![enc_node];
+            if enc_1to1.r#type == "pkmsg" {
+                if let Some(account) = self.store.creds().account {
+                    if let Some(encoded) = crate::handshake::encode_signed_device_identity(&account, true) {
+                        children.push(BinaryNode::new("device-identity").with_bytes(encoded));
+                    }
+                }
+            }
+
+            // Node linha 854: `stanza.attrs.to = destinationJid` +
+            // `stanza.attrs.participant = participant.jid`.
+            let mut stanza = BinaryNode::new("message")
+                .with_attr("id", msg_id)
+                .with_attr("type", get_message_type(&message))
+                .with_attr("to", jid)
+                .with_attr("participant", &participant.jid)
+                .with_attr("addressing_mode", addressing_mode);
+            for &(k, v) in extra_attrs {
+                stanza = stanza.with_attr(k, v);
+            }
+            let stanza = stanza.with_children(children);
+
+            self.send_node(&stanza, sink).await?;
+            tracing::debug!(msg_id, jid, participant = %participant.jid, "mensagem de grupo reenviada para participante (retry)");
+            return Ok(SendMessageResult { message_id: msg_id.to_string() });
+        }
+
         // Node: encryptGroupMessage({ group: destinationJid, data: bytes, meId: meLid }).
         let enc = repo.encrypt_group_message(
             jid,
@@ -3685,8 +3978,8 @@ impl Client {
             &write_random_pad_max16(&message.encode_to_vec()),
         )?;
 
-        // Metadados do grupo (participantes).
-        let meta = self.group_metadata(jid, sink).await?;
+        // (`_is_retry` sem participant cai no fanout normal, como no Node quando
+        // `sendToAll` é verdadeiro — o retry sem device do participante.)
 
         // Devices de todos os participantes (lid || id).
         let participant_jids: Vec<String> = meta
@@ -3825,9 +4118,8 @@ impl Client {
         }
 
         let mut children = Vec::new();
-        if !participants.is_empty() {
-            children.push(BinaryNode::new("participants").with_children(participants));
-        }
+        // Node `messages-send.ts` linha 739: o `enc` (skmsg) vem ANTES de
+        // `participants` e de `device-identity` no content do stanza.
         // `extraAttrs` do Node: `mediatype` no `enc` skmsg para mensagens de mídia.
         let mut skmsg_enc = BinaryNode::new("enc")
             .with_attr("v", "2")
@@ -3836,6 +4128,9 @@ impl Client {
             skmsg_enc = skmsg_enc.with_attr("mediatype", mediatype);
         }
         children.push(skmsg_enc.with_bytes(enc.ciphertext));
+        if !participants.is_empty() {
+            children.push(BinaryNode::new("participants").with_children(participants));
+        }
         if should_include_device_identity {
             if let Some(account) = self.store.creds().account {
                 if let Some(encoded) = crate::handshake::encode_signed_device_identity(&account, true) {
@@ -3848,12 +4143,7 @@ impl Client {
             .with_attr("id", msg_id)
             .with_attr("type", get_message_type(&message))
             .with_attr("to", jid)
-            .with_attr(
-                "addressing_mode",
-                meta.addressing_mode
-                    .as_deref()
-                    .unwrap_or("pn"),
-            );
+            .with_attr("addressing_mode", addressing_mode);
         for &(k, v) in extra_attrs {
             stanza = stanza.with_attr(k, v);
         }
@@ -3868,6 +4158,11 @@ impl Client {
             participants = sender_key_jids.len(),
             ?sender_key_jids,
             "stanza de grupo preparado"
+        );
+
+        tracing::info!(
+            stanza = %serde_json::to_string(&node_to_json(&stanza)).unwrap_or_default(),
+            "STANZA_SEND"
         );
 
         self.send_node(&stanza, sink).await?;
@@ -4621,6 +4916,78 @@ fn get_status_from_receipt_type(r#type: Option<&str>) -> Option<i32> {
         Some("played") => Some(wa::web_message_info::Status::Played as i32),
         Some("read") | Some("read-self") => Some(wa::web_message_info::Status::Read as i32),
         None => Some(wa::web_message_info::Status::DeliveryAck as i32),
+        _ => None,
+    }
+}
+
+/// Serializa um `BinaryNode` como JSON no formato do Node/Hineken
+/// (`{ tag, attrs, content }`), com bytes em base64 — usado no log
+/// `STANZA_SEND` para comparar os nodes JS vs Rust.
+fn node_to_json(node: &baileys_core::BinaryNode) -> serde_json::Value {
+    let content = match &node.content {
+        Some(baileys_core::BinaryContent::Children(children)) => {
+            serde_json::Value::Array(children.iter().map(node_to_json).collect())
+        }
+        Some(baileys_core::BinaryContent::String(s)) => serde_json::Value::String(s.clone()),
+        Some(baileys_core::BinaryContent::Bytes(b)) => {
+            use base64::Engine as _;
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b))
+        }
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "tag": node.tag,
+        "attrs": node.attrs,
+        "content": content,
+    })
+}
+
+/// `isTcTokenExpired` (port de `Utils/tc-token-utils.ts`) — bucket rolante
+/// do WA Web: expira se o timestamp está antes do cutoff de 4 buckets.
+fn is_tc_token_expired(timestamp: Option<&str>) -> bool {
+    const BUCKET_DURATION: i64 = 604800; // 7 dias
+    const NUM_BUCKETS: i64 = 4;
+    let Some(ts) = timestamp else { return true };
+    let Ok(ts) = ts.parse::<i64>() else { return true };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let current_bucket = now / BUCKET_DURATION;
+    let cutoff_bucket = current_bucket - (NUM_BUCKETS - 1);
+    let cutoff_timestamp = cutoff_bucket * BUCKET_DURATION;
+    ts < cutoff_timestamp
+}
+
+/// `computeCsToken` (port de `Utils/tc-token-utils.ts`) — HMAC-SHA256 do
+/// `nctSalt` sobre o `recipientLid` UTF-8.
+fn compute_cs_token(nct_salt: &[u8], recipient_lid: &str) -> Vec<u8> {
+    baileys_crypto::hmac_sign(recipient_lid.as_bytes(), nct_salt, baileys_crypto::HmacVariant::Sha256)
+}
+
+/// Extrai bytes de um valor JSON do BufferJSON: `{"type":"Buffer","data":"..."}`
+/// ou array de números (reviver do `contacts-tc-token`).
+fn buffer_value_bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let data = map.get("data").or_else(|| map.get("value"));
+            match data {
+                Some(serde_json::Value::String(s)) => {
+                    base64::engine::general_purpose::STANDARD.decode(s).ok()
+                }
+                Some(serde_json::Value::Array(arr)) => Some(
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u8))
+                        .collect(),
+                ),
+                _ => None,
+            }
+        }
+        serde_json::Value::Array(arr) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                .collect(),
+        ),
         _ => None,
     }
 }
