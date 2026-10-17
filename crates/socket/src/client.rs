@@ -425,7 +425,7 @@ impl Client {
             qr_rotation: Mutex::new(None),
             send_cache: Mutex::new(HashMap::new()),
             send_cache_order: Mutex::new(Vec::new()),
-            force_session_cache: TtlCache::new(Duration::from_secs(86400), 2000),
+            force_session_cache: TtlCache::new(Duration::from_secs(600), 2000),
             retry_mutex: Mutex::new(()),
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
@@ -516,8 +516,10 @@ impl Client {
             .set_backend(&format!("cache:instance:{instance_key}:msgretry"), Some(backend.clone()));
         self.placeholder_resend_cache
             .set_backend(&format!("cache:instance:{instance_key}:placeholder"), Some(backend.clone()));
-        self.force_session_cache
-            .set_backend(&format!("cache:instance:{instance_key}:forcesession"), Some(backend));
+        // `forceSession` do Node é `NodeCache({ stdTTL: 600 })` SÓ em memória
+        // (cache-utils.ts) — nunca vai pro Redis. Offload aqui faria o force
+        // valer por 24h/até expirar no Redis e o retry subsequente nunca
+        // refaria o `<iq encrypt>` (mensagem presa em "aguardando").
     }
 
     /// Insere no `send_cache` com limite FIFO (`SEND_CACHE_MAX`). Remove a
@@ -2896,133 +2898,53 @@ impl Client {
             self.assert_sessions(&[retry_participant.clone()], force, lid.as_deref(), sink).await?;
         }
 
-        // Re-cifra a mensagem do cache.
-        let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
-        let is_me_retry = are_jids_same_user(&retry_participant, &me_id)
-            || (!me_lid.is_empty() && are_jids_same_user(&retry_participant, &me_lid));
-
-        let is_group = baileys_core::is_jid_group(&target_jid);
-        if is_group {
-            // Node `messages-recv.ts:898`: antes do reenvio em grupo, apaga a
-            // `sender-key-memory` do grupo para forçar nova distribuição da
-            // sender key (senão o peer reusa uma chave antiga e não decripta).
+        // Node `messages-recv.ts:898`: antes do reenvio em grupo, apaga a
+        // `sender-key-memory` do grupo para forçar nova distribuição da
+        // sender key (senão o peer reusa uma chave antiga e não decripta).
+        if baileys_core::is_jid_group(&target_jid) {
             self.sender_key_memory.remove(&target_jid).await;
-
-            // Grupo: re-cifra com sender-key (`skmsg`) e inclui a distribuição
-            // da sender-key como `pkmsg` 1:1 para o participante pedinte.
-            let enc = repo.encrypt_group_message(
-                &target_jid,
-                &me_lid,
-                &write_random_pad_max16(&cached_bytes),
-            )?;
-            let sk_node = BinaryNode::new("enc")
-                .with_attr("v", "2")
-                .with_attr("type", "skmsg")
-                .with_bytes(enc.ciphertext);
-
-            // Distribui a sender-key para o participante (pkmsg).
-            let sender_key_msg = wa::Message {
-                sender_key_distribution_message: Some(
-                    wa::message::SenderKeyDistributionMessage {
-                        group_id: Some(target_jid.clone()),
-                        axolotl_sender_key_distribution_message: Some(
-                            enc.sender_key_distribution_message.clone(),
-                        ),
-                    },
-                ),
-                ..Default::default()
-            };
-            let dest = convert_lid_device(&retry_participant, lid.as_deref(), &me_id, &me_lid);
-            let sk_enc = repo.encrypt_message(
-                &dest,
-                &write_random_pad_max16(&sender_key_msg.encode_to_vec()),
-            )?;
-            let to_node = BinaryNode::new("to")
-                .with_attr("jid", &retry_participant)
-                .with_children(vec![BinaryNode::new("enc")
-                    .with_attr("v", "2")
-                    .with_attr("type", &sk_enc.r#type)
-                    .with_bytes(sk_enc.ciphertext)]);
-
-            let mut children = vec![
-                BinaryNode::new("participants").with_children(vec![to_node]),
-                sk_node,
-            ];
-            if sk_enc.r#type == "pkmsg" {
-                if let Some(account) = self.store.creds().account {
-                    if let Some(encoded) = crate::handshake::encode_signed_device_identity(&account, true) {
-                        children.push(BinaryNode::new("device-identity").with_bytes(encoded));
-                    }
-                }
-            }
-            let mut stanza = BinaryNode::new("message")
-                .with_attr("id", &msg_id)
-                .with_attr("type", "text")
-                .with_attr("to", &target_jid)
-                .with_children(children);
-            if let Some(p) = &participant {
-                stanza = stanza.with_attr("participant", p);
-            }
-            self.send_node(&stanza, sink).await?;
-            tracing::debug!(msg_id, target_jid, retry_participant, "mensagem de grupo reenviada após retry");
-            return Ok(());
         }
 
-        // PV: reembrulha em `deviceSentMessage` se o pedinte for device nosso.
-        let payload = if is_me_retry {
-            let dest_jid = baileys_core::jid_normalized_user(&target_jid);
-            let cached_msg = wa::Message::decode(cached_bytes.as_slice()).unwrap_or_default();
-            wa::Message {
-                device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
-                    destination_jid: Some(dest_jid.clone()),
-                    message: Some(Box::new(cached_msg)),
-                    phash: None,
-                })),
-                ..Default::default()
-            }
-            .encode_to_vec()
-        } else {
-            // Node `messages-recv.ts:943`: `delete msg.messageContextInfo`
-            // antes do reenvio PV — sem isso o contextInfo original (segredo
-            // de reporting) é re-injetado no payload do retry.
-            let mut cached_msg = wa::Message::decode(cached_bytes.as_slice()).unwrap_or_default();
-            cached_msg.message_context_info = None;
-            cached_msg.encode_to_vec()
+        // Node `messages-recv.ts:940-946`: recupera a mensagem, apaga o
+        // `messageContextInfo` (segredo de reporting) e delega para o
+        // `relayMessage` com `{ messageId, isretry: true, participant }`.
+        let mut msg = wa::Message::decode(cached_bytes.as_slice()).unwrap_or_default();
+        msg.message_context_info = None;
+
+        // `retryNode.attrs.count` (Node `messages-recv.ts:881`).
+        let retry_count = node
+            .child("retry")
+            .and_then(|r| r.attr("count"))
+            .and_then(|c| c.parse::<u32>().ok())
+            .unwrap_or(1);
+
+        let relay_participant = RelayParticipant {
+            jid: retry_participant.clone(),
+            count: retry_count.max(1),
         };
 
-        let dest = convert_lid_device(&retry_participant, lid.as_deref(), &me_id, &me_lid);
-        let enc = repo.encrypt_message(&dest, &write_random_pad_max16(&payload))?;
-
-        let enc_node = BinaryNode::new("enc")
-            .with_attr("v", "2")
-            .with_attr("type", &enc.r#type)
-            .with_bytes(enc.ciphertext);
-        let to_node = BinaryNode::new("to")
-            .with_attr("jid", &retry_participant)
-            .with_children(vec![enc_node]);
-        let mut children = vec![BinaryNode::new("participants").with_children(vec![to_node])];
-        if enc.r#type == "pkmsg" {
-            if let Some(account) = self.store.creds().account {
-                if let Some(encoded) = crate::handshake::encode_signed_device_identity(&account, true) {
-                    children.push(BinaryNode::new("device-identity").with_bytes(encoded));
-                }
-            }
-        }
-
-        // Stanza do reenvio (Node linhas 857–865): para device meu,
-        // `to = retryParticipant` e `recipient = destinationJid`.
-        let mut stanza = BinaryNode::new("message")
-            .with_attr("id", &msg_id)
-            .with_attr("to", &retry_participant);
-        if is_me_retry {
-            stanza = stanza.with_attr("recipient", baileys_core::jid_normalized_user(&target_jid));
-        }
-        stanza = stanza.with_attr("type", "text");
-        let stanza = stanza.with_children(children);
-
-        self.send_node(&stanza, sink).await?;
-        tracing::debug!(msg_id, target_jid, retry_participant, "mensagem reenviada após retry");
-        Ok(())
+        let result = if baileys_core::is_jid_group(&target_jid) {
+            self.relay_group_message_retry(
+                &target_jid,
+                msg,
+                &msg_id,
+                &relay_participant,
+                sink,
+                &[],
+            )
+            .await
+        } else {
+            self.relay_message_retry(
+                &target_jid,
+                msg,
+                &msg_id,
+                &relay_participant,
+                sink,
+                &[],
+            )
+            .await
+        };
+        result.map(|_| ())
     }
 
     /// Envia uma mensagem de texto 1:1.
@@ -3912,16 +3834,16 @@ impl Client {
                 &me_lid,
                 &write_random_pad_max16(&message.encode_to_vec()),
             )?;
-            let message_to_send = wa::Message {
-                sender_key_distribution_message: Some(
-                    wa::message::SenderKeyDistributionMessage {
+            let message_to_send = {
+                let mut patched = message.clone();
+                patched.sender_key_distribution_message =
+                    Some(wa::message::SenderKeyDistributionMessage {
                         axolotl_sender_key_distribution_message: Some(
                             enc.sender_key_distribution_message.clone(),
                         ),
                         group_id: Some(jid.to_string()),
-                    },
-                ),
-                ..Default::default()
+                    });
+                patched
             };
             let lid = self.get_lid(&participant.jid, sink).await?;
             let dest = convert_lid_device(&participant.jid, lid.as_deref(), &me_id, &me_lid);
@@ -3936,6 +3858,10 @@ impl Client {
                 ("type", &enc_1to1.r#type),
                 ("count", &count_str),
             ];
+            // `extraAttrs['mediatype']` do Node (`messages-send.ts` linhas 508–511).
+            if let Some(mediatype) = get_media_type(&message) {
+                enc_attrs.push(("mediatype", mediatype));
+            }
             for (k, v) in extra_attrs {
                 enc_attrs.push((k, v));
             }
