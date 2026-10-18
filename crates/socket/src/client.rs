@@ -2579,6 +2579,7 @@ impl Client {
             .with_attr("push_priority", "high_force")
             .with_children(children);
 
+        tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
         self.send_node(&stanza, sink).await?;
         tracing::debug!(msg_id, jid, "peer data operation enviada");
         Ok(())
@@ -2601,7 +2602,7 @@ impl Client {
         let recipient = node.attr("recipient").map(String::from);
         let msg_id = node.attr("id").unwrap_or_default().to_string();
 
-        tracing::info!(
+        tracing::debug!(
             receipt_type,
             from,
             participant,
@@ -2736,7 +2737,7 @@ impl Client {
         // Serializa o processamento de retry (port do `retryMutex` do Node).
         let _retry_guard = self.retry_mutex.lock().await;
 
-        tracing::info!(msg_id, participant, "retry: processando em task separada");
+        tracing::debug!(msg_id, participant, "retry: processando em task separada");
 
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
         let me_lid = self
@@ -3114,6 +3115,7 @@ impl Client {
             }
             let stanza = stanza.with_children(children);
 
+            tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
             self.send_node(&stanza, sink).await?;
             tracing::debug!(msg_id, jid, participant = %participant.jid, "mensagem 1:1 reenviada para participante (retry)");
             return Ok(SendMessageResult { message_id: msg_id.to_string() });
@@ -3347,10 +3349,7 @@ impl Client {
         }
         let stanza = stanza.with_children(children);
 
-        tracing::info!(
-            stanza = %serde_json::to_string(&node_to_json(&stanza)).unwrap_or_default(),
-            "STANZA_SEND"
-        );
+        tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
 
         self.send_node(&stanza, sink).await?;
 
@@ -3892,6 +3891,7 @@ impl Client {
             }
             let stanza = stanza.with_children(children);
 
+            tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
             self.send_node(&stanza, sink).await?;
             tracing::debug!(msg_id, jid, participant = %participant.jid, "mensagem de grupo reenviada para participante (retry)");
             return Ok(SendMessageResult { message_id: msg_id.to_string() });
@@ -4086,10 +4086,7 @@ impl Client {
             "stanza de grupo preparado"
         );
 
-        tracing::info!(
-            stanza = %serde_json::to_string(&node_to_json(&stanza)).unwrap_or_default(),
-            "STANZA_SEND"
-        );
+        tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
 
         self.send_node(&stanza, sink).await?;
 
@@ -4456,7 +4453,7 @@ impl Client {
         sink: &WsSink,
     ) -> Result<BinaryNode, ClientError> {
         let id = node.attr("id").unwrap_or_default().to_string();
-        tracing::info!(id = %id, "query_node: enviando query");
+        tracing::debug!(id = %id, "query_node: enviando query");
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_queries.lock().await.insert(id.clone(), tx);
         self.send_node(&node, sink).await?;
@@ -4846,24 +4843,46 @@ fn get_status_from_receipt_type(r#type: Option<&str>) -> Option<i32> {
     }
 }
 
-/// Serializa um `BinaryNode` como JSON no formato do Node/Hineken
-/// (`{ tag, attrs, content }`), com bytes em base64 — usado no log
-/// `STANZA_SEND` para comparar os nodes JS vs Rust.
-fn node_to_json(node: &baileys_core::BinaryNode) -> serde_json::Value {
+/// Pretty-print de um `BinaryNode` no shape do `console.dir(stanza, { depth: null })`
+/// do Node/Hineken: `{ tag, attrs: {objeto}, content }`, com bytes em hex
+/// (`<0a 12 ...>`), multilinha e indentação de 2 espaços. Usado nos logs
+/// `STANZA_SEND` para diff linha a linha com o TS.
+fn pretty_node(node: &baileys_core::BinaryNode) -> String {
+    serde_json::to_string_pretty(&pretty_node_value(node)).unwrap_or_default()
+}
+
+fn pretty_node_value(node: &baileys_core::BinaryNode) -> serde_json::Value {
+    // `attrs` vira objeto (como no Node), não `[["k","v"], ...]`. Chave
+    // duplicada → a última vence (mesmo efeito de sobrescrever no objeto JS).
+    let mut attrs = serde_json::Map::new();
+    for (k, v) in &node.attrs {
+        attrs.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+
     let content = match &node.content {
         Some(baileys_core::BinaryContent::Children(children)) => {
-            serde_json::Value::Array(children.iter().map(node_to_json).collect())
+            serde_json::Value::Array(children.iter().map(pretty_node_value).collect())
         }
         Some(baileys_core::BinaryContent::String(s)) => serde_json::Value::String(s.clone()),
         Some(baileys_core::BinaryContent::Bytes(b)) => {
-            use base64::Engine as _;
-            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b))
+            // Espelha o `<Buffer 0a 12 34 ...>` do Node, truncando como o
+            // `inspect` faz para buffers grandes (legível para o diff).
+            let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
+            let shown = if hex.len() > 128 {
+                let mut v = hex[..128].to_vec();
+                v.push("...".to_string());
+                v
+            } else {
+                hex
+            };
+            serde_json::Value::String(format!("<{}>", shown.join(" ")))
         }
         None => serde_json::Value::Null,
     };
+
     serde_json::json!({
         "tag": node.tag,
-        "attrs": node.attrs,
+        "attrs": serde_json::Value::Object(attrs),
         "content": content,
     })
 }
