@@ -3808,13 +3808,34 @@ impl Client {
         _is_retry: bool,
     ) -> Result<SendMessageResult, ClientError> {
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
-        let me_lid = self
+        let mut me_lid = self
             .store
             .creds()
             .me
             .clone()
             .and_then(|m| m.lid)
-            .unwrap_or_else(|| me_id.clone());
+            .unwrap_or_default();
+
+        // `me.lid` vazio → resolve via USync e persiste antes de cifrar, para
+        // que a sender key do grupo NUNCA seja estabelecida com identidade PN
+        // (senão o servidor retransmite o autor como `número@...` e o celular
+        // do destinatário imprime o JID bruto na bolha).
+        if !baileys_core::is_lid_user(&me_lid) {
+            if let Some(lid) = self.get_lid(&me_id, sink).await? {
+                me_lid = lid;
+                let mut creds = self.store.creds();
+                if let Some(me) = &mut creds.me {
+                    me.lid = Some(me_lid.clone());
+                    self.store.update_creds(creds.clone())?;
+                    let _ = self.events.send(ClientEvent::CredsUpdate(creds));
+                }
+            }
+        }
+        if me_lid.is_empty() {
+            return Err(ClientError::InvalidParams(
+                "me.lid indisponível para envio em grupo".to_string(),
+            ));
+        }
 
         let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
 
@@ -3924,24 +3945,27 @@ impl Client {
 
         let mut devices = self.get_usync_devices(&participant_jids, sink, true).await?;
 
-        // Garante nosso device 0 (primary) no fanout, como o Node faz:
-        // apenas via LID (`{user: jlidUser, device: 0, jid: jidNormalizedUser(meLid)}`).
-        // O push por PN (`@s.whatsapp.net`) fazia o Android de terceiros exibir o
-        // JID bruto `número:device` em vez de resolver a sender key do autor.
+        // Garante nosso device 0 (primary) no fanout — paridade Node
+        // (`messages-send.ts:679-684`): quando o USync não retornou o phone,
+        // empurra DOIS entries — o entry LID (`jlidUser` → `meLid`) e o entry
+        // PN (`user` → `meId`). `me.lid` já está garantido acima, então nunca
+        // fabricamos `@lid` a partir do PN.
         let me_lid_user = jid_user(&me_lid).unwrap_or_default();
         let me_id_user = jid_user(&me_id).unwrap_or_default();
         let has_me_phone = devices
             .iter()
             .any(|(u, d, _)| u == &me_lid_user && *d == 0);
         if !has_me_phone {
-            // Phone via LID: quando `me.lid` está vazio (`me_lid` caiu para PN),
-            // forçamos `{user}@lid` em vez de cair em `@s.whatsapp.net`.
-            let phone_lid_jid = if baileys_core::is_lid_user(&me_lid) {
-                baileys_core::jid_normalized_user(&me_lid)
-            } else {
-                format!("{me_lid_user}@lid")
-            };
-            devices.push((me_lid_user.clone(), 0, phone_lid_jid));
+            devices.push((
+                me_lid_user.clone(),
+                0,
+                baileys_core::jid_normalized_user(&me_lid),
+            ));
+            devices.push((
+                me_id_user.clone(),
+                0,
+                baileys_core::jid_normalized_user(&me_id),
+            ));
         }
         tracing::debug!(?devices, "fanout grupo após correção de device 0");
 
