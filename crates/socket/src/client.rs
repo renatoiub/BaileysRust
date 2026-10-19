@@ -3950,22 +3950,20 @@ impl Client {
         // empurra DOIS entries — o entry LID (`jlidUser` → `meLid`) e o entry
         // PN (`user` → `meId`). `me.lid` já está garantido acima, então nunca
         // fabricamos `@lid` a partir do PN.
+        //
+        // IMPORTANTE: no Node, `user` aqui vem de `jidDecode(jid).user` — e,
+        // para envio de grupo, `jid` é o JID do grupo (`...@g.us`). Usar o
+        // número do remetente (`me_id_user`) no lugar do `user` do destino faz
+        // o `senderId` PN virar `{numero}@s.whatsapp.net`, distribuindo a
+        // sender key sob a identidade PN do remetente — e o WhatsApp do
+        // destinatário imprime `numero:device@s.whatsapp.net` na bolha.
         let me_lid_user = jid_user(&me_lid).unwrap_or_default();
         let me_id_user = jid_user(&me_id).unwrap_or_default();
         let has_me_phone = devices
             .iter()
             .any(|(u, d, _)| u == &me_lid_user && *d == 0);
         if !has_me_phone {
-            devices.push((
-                me_lid_user.clone(),
-                0,
-                baileys_core::jid_normalized_user(&me_lid),
-            ));
-            devices.push((
-                me_id_user.clone(),
-                0,
-                baileys_core::jid_normalized_user(&me_id),
-            ));
+            devices.extend(device0_fallback_entries(&me_lid, &me_id, jid));
         }
         tracing::debug!(?devices, "fanout grupo após correção de device 0");
 
@@ -4844,6 +4842,30 @@ fn jid_device(jid: &str) -> Option<u32> {
     baileys_core::jid_decode(jid).and_then(|d| d.device)
 }
 
+/// Entradas de fallback do device 0 do remetente no fanout de grupo — port
+/// de `messages-send.ts:679-684` do Node.
+///
+/// Quando o USync não retornou o phone (device 0), o Node empurra DOIS
+/// entries: a LID (`jlidUser` → `meLid`) e a PN (`user` → `meId`), onde `user`
+/// vem de `jidDecode(destinationJid).user` — para grupo, o user do próprio
+/// grupo (`...@g.us`), NÃO o número do remetente. Isso faz o `senderId` PN
+/// virar `{group_id}@s.whatsapp.net` (inócuo) em vez de distribuir a sender
+/// key sob a identidade PN do remetente (`{numero}@s.whatsapp.net`), que é o
+/// que faz o WhatsApp do destinatário exibir `numero:device@s.whatsapp.net`
+/// na bolha.
+fn device0_fallback_entries(
+    me_lid: &str,
+    me_id: &str,
+    dest_jid: &str,
+) -> Vec<(String, u32, String)> {
+    let me_lid_user = jid_user(me_lid).unwrap_or_default();
+    let dest_user = jid_user(dest_jid).unwrap_or_default();
+    vec![
+        (me_lid_user, 0, baileys_core::jid_normalized_user(me_lid)),
+        (dest_user, 0, baileys_core::jid_normalized_user(me_id)),
+    ]
+}
+
 fn is_jid_user(jid: &str) -> bool {
     baileys_core::is_jid_user(jid)
 }
@@ -5069,6 +5091,46 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("baileys-socket-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn device0_fallback_pn_uses_destination_user_not_sender() {
+        // Paridade com `messages-send.ts:679-684`: a entrada PN do fallback
+        // usa `jidDecode(destinationJid).user` — para grupo, o user do grupo
+        // — NUNCA o número do remetente. Se usasse o número, o senderId PN
+        // distribuiria a sender key sob `{numero}@s.whatsapp.net` e o
+        // destinatário imprimiria `numero:device@s.whatsapp.net` na bolha.
+        let me_lid = "5531999999999@lid";
+        let me_id = "5511988888888:7@s.whatsapp.net";
+        let group_jid = "1203630123456789@g.us";
+
+        let entries = device0_fallback_entries(me_lid, me_id, group_jid);
+        assert_eq!(entries.len(), 2);
+
+        // Entrada LID: user = meLid user, jid = meLid normalizado.
+        assert_eq!(entries[0].0, "5531999999999");
+        assert_eq!(entries[0].1, 0);
+        assert_eq!(entries[0].2, "5531999999999@lid");
+
+        // Entrada PN: user = user do GRUPO (não o remetente), jid = meId normalizado.
+        assert_eq!(entries[1].0, "1203630123456789");
+        assert_eq!(entries[1].1, 0);
+        assert_eq!(entries[1].2, "5511988888888@s.whatsapp.net");
+
+        // O senderId PN gerado no fanout usa o user do destino, não do remetente.
+        let (user, device, dev_jid) = &entries[1];
+        let server = if baileys_core::is_lid_user(dev_jid) {
+            "lid"
+        } else {
+            "s.whatsapp.net"
+        };
+        let sender_id = if *device == 0 {
+            format!("{user}@{server}")
+        } else {
+            format!("{user}:{device}@{server}")
+        };
+        assert_eq!(sender_id, "1203630123456789@s.whatsapp.net");
+        assert_ne!(sender_id, "5511988888888@s.whatsapp.net");
     }
 
     #[test]
