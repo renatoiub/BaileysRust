@@ -3838,7 +3838,6 @@ impl Client {
         }
 
         tracing::info!(
-            target: "send_group",
             msg_id,
             jid,
             me_id = %me_id,
@@ -3847,7 +3846,14 @@ impl Client {
             "SEND_GROUP: entrada"
         );
         tracing::info!(
-            target: "send_group",
+            msg_id,
+            "SEND_GROUP: authState.creds.account (console.dir)\n{}",
+            serde_json::to_string_pretty(
+                &self.store.creds().account.clone().unwrap_or(serde_json::Value::Null)
+            )
+            .unwrap_or_default()
+        );
+        tracing::info!(
             msg_id,
             "SEND_GROUP: message ANTES de criptografar (console.dir)\n{}",
             pretty_proto(&message)
@@ -3860,7 +3866,6 @@ impl Client {
         let meta = self.group_metadata(jid, sink).await?;
         let addressing_mode = meta.addressing_mode.as_deref().unwrap_or("pn");
         tracing::info!(
-            target: "send_group",
             msg_id,
             group = jid,
             addressing_mode,
@@ -3868,7 +3873,6 @@ impl Client {
             "SEND_GROUP: groupData (addressing_mode + participantes)"
         );
         tracing::info!(
-            target: "send_group",
             msg_id,
             "SEND_GROUP: groupData.participants\n{}",
             serde_json::to_string_pretty(
@@ -3914,7 +3918,6 @@ impl Client {
             )?;
 
             tracing::info!(
-                target: "send_group",
                 msg_id,
                 participant = %participant.jid,
                 count = participant.count,
@@ -3966,7 +3969,7 @@ impl Client {
             }
             let stanza = stanza.with_children(children);
 
-            tracing::info!(target: "send_group", msg_id, "SEND_GROUP: STANZA_SEND (retry)\n{}", pretty_node(&stanza));
+            tracing::info!(msg_id, "SEND_GROUP: STANZA_SEND (retry)\n{}", pretty_node(&stanza));
             self.send_node(&stanza, sink).await?;
             tracing::debug!(msg_id, jid, participant = %participant.jid, "mensagem de grupo reenviada para participante (retry)");
             return Ok(SendMessageResult { message_id: msg_id.to_string() });
@@ -3980,7 +3983,6 @@ impl Client {
         )?;
 
         tracing::info!(
-            target: "send_group",
             msg_id,
             group = jid,
             me_lid,
@@ -4010,7 +4012,6 @@ impl Client {
         let mut devices = self.get_usync_devices(&participant_jids, sink, true).await?;
 
         tracing::info!(
-            target: "send_group",
             msg_id,
             group = jid,
             "SEND_GROUP: devices ANTES do fallback device 0 (getUSyncDevices)\n{}",
@@ -4038,7 +4039,6 @@ impl Client {
             devices.extend(device0_fallback_entries(&me_lid, &me_id, jid));
         }
         tracing::info!(
-            target: "send_group",
             msg_id,
             has_me_phone,
             me_lid_user = %me_lid_user,
@@ -4062,7 +4062,6 @@ impl Client {
         };
 
         tracing::info!(
-            target: "send_group",
             msg_id,
             group = jid,
             "SEND_GROUP: senderKeyMsg (SenderKeyDistributionMessage como Message, console.dir)\n{}",
@@ -4091,7 +4090,6 @@ impl Client {
         }
         if !sender_key_map.is_empty() {
             tracing::info!(
-                target: "send_group",
                 msg_id,
                 group = jid,
                 "SEND_GROUP: senderKeyMap (sender-key-memory)\n{}",
@@ -4100,7 +4098,6 @@ impl Client {
             self.sender_key_memory.set(jid.to_string(), sender_key_map).await;
         }
         tracing::info!(
-            target: "send_group",
             msg_id,
             group = jid,
             "SEND_GROUP: senderKeyJids\n{}",
@@ -4159,7 +4156,6 @@ impl Client {
                     should_include_device_identity = true;
                 }
                 tracing::info!(
-                    target: "send_group",
                     msg_id,
                     sender_id = %sender_id,
                     dest,
@@ -4194,7 +4190,6 @@ impl Client {
             if let Some(account) = self.store.creds().account {
                 if let Some(encoded) = crate::handshake::encode_signed_device_identity(&account, true) {
                     tracing::info!(
-                        target: "send_group",
                         msg_id,
                         account_signature_key = account.get("accountSignatureKey").and_then(|v| v.get("data")).and_then(|v| v.as_str()).map(|s| s.len()),
                         "SEND_GROUP: incluindo device-identity (pkmsg presente)"
@@ -4225,7 +4220,7 @@ impl Client {
             "stanza de grupo preparado"
         );
 
-        tracing::info!(target: "send_group", msg_id, "SEND_GROUP: STANZA_SEND\n{}", pretty_node(&stanza));
+        tracing::info!(msg_id, "SEND_GROUP: STANZA_SEND\n{}", pretty_node(&stanza));
 
         self.send_node(&stanza, sink).await?;
 
