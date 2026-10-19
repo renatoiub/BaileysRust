@@ -3837,12 +3837,53 @@ impl Client {
             ));
         }
 
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            jid,
+            me_id = %me_id,
+            me_lid = %me_lid,
+            is_retry = participant.is_some(),
+            "SEND_GROUP: entrada"
+        );
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            "SEND_GROUP: message ANTES de criptografar (console.dir)\n{}",
+            pretty_proto(&message)
+        );
+
         let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
 
         // Metadados do grupo (participantes) — o retry com participant NÃO faz
         // fanout, mas ainda precisa do `addressing_mode` (Node linha 545).
         let meta = self.group_metadata(jid, sink).await?;
         let addressing_mode = meta.addressing_mode.as_deref().unwrap_or("pn");
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            group = jid,
+            addressing_mode,
+            participants_count = meta.participants.len(),
+            "SEND_GROUP: groupData (addressing_mode + participantes)"
+        );
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            "SEND_GROUP: groupData.participants\n{}",
+            serde_json::to_string_pretty(
+                &meta.participants
+                    .iter()
+                    .map(|p| serde_json::json!({
+                        "id": p.id,
+                        "jid": p.jid,
+                        "lid": p.lid,
+                        "admin": p.admin,
+                    }))
+                    .collect::<Vec<_>>()
+            )
+            .unwrap_or_default()
+        );
 
         // `isGroup && participant` (Node linhas 540–590): retry de grupo — a
         // mensagem volta como `senderKeyDistributionMessage` cifrada 1:1 para
@@ -3871,6 +3912,19 @@ impl Client {
                 &dest,
                 &write_random_pad_max16(&message_to_send.encode_to_vec()),
             )?;
+
+            tracing::info!(
+                target: "send_group",
+                msg_id,
+                participant = %participant.jid,
+                count = participant.count,
+                participant_lid = ?lid,
+                dest,
+                enc_1to1_type = %enc_1to1.r#type,
+                ciphertext_len = enc_1to1.ciphertext.len(),
+                "SEND_GROUP: retry participant — messageToSend (console.dir)\n{}",
+                pretty_proto(&message_to_send)
+            );
 
             let count_str = participant.count.max(1).to_string();
             let mut enc_attrs: Vec<(&str, &str)> = vec![
@@ -3912,7 +3966,7 @@ impl Client {
             }
             let stanza = stanza.with_children(children);
 
-            tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
+            tracing::info!(target: "send_group", msg_id, "SEND_GROUP: STANZA_SEND (retry)\n{}", pretty_node(&stanza));
             self.send_node(&stanza, sink).await?;
             tracing::debug!(msg_id, jid, participant = %participant.jid, "mensagem de grupo reenviada para participante (retry)");
             return Ok(SendMessageResult { message_id: msg_id.to_string() });
@@ -3924,6 +3978,16 @@ impl Client {
             &me_lid,
             &write_random_pad_max16(&message.encode_to_vec()),
         )?;
+
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            group = jid,
+            me_lid,
+            skmsg_ciphertext_len = enc.ciphertext.len(),
+            skdm_len = enc.sender_key_distribution_message.len(),
+            "SEND_GROUP: encryptGroupMessage (ciphertext + senderKeyDistributionMessage)"
+        );
 
         // (`_is_retry` sem participant cai no fanout normal, como no Node quando
         // `sendToAll` é verdadeiro — o retry sem device do participante.)
@@ -3945,6 +4009,14 @@ impl Client {
 
         let mut devices = self.get_usync_devices(&participant_jids, sink, true).await?;
 
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            group = jid,
+            "SEND_GROUP: devices ANTES do fallback device 0 (getUSyncDevices)\n{}",
+            pretty_devices(&devices)
+        );
+
         // Garante nosso device 0 (primary) no fanout — paridade Node
         // (`messages-send.ts:679-684`): quando o USync não retornou o phone,
         // empurra DOIS entries — o entry LID (`jlidUser` → `meLid`) e o entry
@@ -3965,7 +4037,16 @@ impl Client {
         if !has_me_phone {
             devices.extend(device0_fallback_entries(&me_lid, &me_id, jid));
         }
-        tracing::debug!(?devices, "fanout grupo após correção de device 0");
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            has_me_phone,
+            me_lid_user = %me_lid_user,
+            me_id_user = %me_id_user,
+            dest_user = %jid_user(jid).unwrap_or_default(),
+            "SEND_GROUP: devices DEPOIS do fallback device 0\n{}",
+            pretty_devices(&devices)
+        );
 
         // senderKeyDistributionMessage como Message (port do `senderKeyMsg`).
         let sender_key_msg = wa::Message {
@@ -3979,6 +4060,14 @@ impl Client {
             ),
             ..Default::default()
         };
+
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            group = jid,
+            "SEND_GROUP: senderKeyMsg (SenderKeyDistributionMessage como Message, console.dir)\n{}",
+            pretty_proto(&sender_key_msg)
+        );
 
         let mut sender_key_jids: Vec<String> = Vec::new();
         // `sender-key-memory` do Node: `senderKeyMap[senderId] = true` — reuso
@@ -4001,9 +4090,22 @@ impl Client {
             sender_key_jids.push(sender_id);
         }
         if !sender_key_map.is_empty() {
+            tracing::info!(
+                target: "send_group",
+                msg_id,
+                group = jid,
+                "SEND_GROUP: senderKeyMap (sender-key-memory)\n{}",
+                serde_json::to_string_pretty(&serde_json::json!(sender_key_map)).unwrap_or_default()
+            );
             self.sender_key_memory.set(jid.to_string(), sender_key_map).await;
         }
-        tracing::debug!(?sender_key_jids, "fanout grupo: sender_key_jids");
+        tracing::info!(
+            target: "send_group",
+            msg_id,
+            group = jid,
+            "SEND_GROUP: senderKeyJids\n{}",
+            serde_json::to_string_pretty(&sender_key_jids).unwrap_or_default()
+        );
         tracing::info!(
             participants = sender_key_jids.len(),
             group = jid,
@@ -4056,6 +4158,15 @@ impl Client {
                 if sk_enc.r#type == "pkmsg" {
                     should_include_device_identity = true;
                 }
+                tracing::info!(
+                    target: "send_group",
+                    msg_id,
+                    sender_id = %sender_id,
+                    dest,
+                    enc_type = %sk_enc.r#type,
+                    ciphertext_len = sk_enc.ciphertext.len(),
+                    "SEND_GROUP: participant node (to/enc)"
+                );
                 participants.push(BinaryNode::new("to").with_attr("jid", sender_id).with_children(vec![
                     BinaryNode::new("enc")
                         .with_attr("v", "2")
@@ -4082,6 +4193,12 @@ impl Client {
         if should_include_device_identity {
             if let Some(account) = self.store.creds().account {
                 if let Some(encoded) = crate::handshake::encode_signed_device_identity(&account, true) {
+                    tracing::info!(
+                        target: "send_group",
+                        msg_id,
+                        account_signature_key = account.get("accountSignatureKey").and_then(|v| v.get("data")).and_then(|v| v.as_str()).map(|s| s.len()),
+                        "SEND_GROUP: incluindo device-identity (pkmsg presente)"
+                    );
                     children.push(BinaryNode::new("device-identity").with_bytes(encoded));
                 }
             }
@@ -4108,7 +4225,7 @@ impl Client {
             "stanza de grupo preparado"
         );
 
-        tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
+        tracing::info!(target: "send_group", msg_id, "SEND_GROUP: STANZA_SEND\n{}", pretty_node(&stanza));
 
         self.send_node(&stanza, sink).await?;
 
@@ -4931,6 +5048,29 @@ fn pretty_node_value(node: &baileys_core::BinaryNode) -> serde_json::Value {
         "attrs": serde_json::Value::Object(attrs),
         "content": content,
     })
+}
+
+/// Pretty-print de uma mensagem prost no shape do `console.dir(msg, { depth: null })`
+/// do Node: JSON camelCase (mesmo serializador usado nos webhooks), com campos
+/// vazios omitidos. Usado nos logs de diagnóstico do envio em grupo.
+fn pretty_proto(msg: &impl prost_reflect::ReflectMessage) -> String {
+    serde_json::to_string_pretty(&baileys_proto::proto_to_json_value(msg)).unwrap_or_default()
+}
+
+/// Serializa devices `(user, device, jid)` no shape do array de objects do Node:
+/// `[ { user, device, jid }, ... ]`.
+fn pretty_devices(devices: &[(String, u32, String)]) -> String {
+    let arr: Vec<serde_json::Value> = devices
+        .iter()
+        .map(|(user, device, jid)| {
+            serde_json::json!({
+                "user": user,
+                "device": device,
+                "jid": jid,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&arr).unwrap_or_default()
 }
 
 /// `isTcTokenExpired` (port de `Utils/tc-token-utils.ts`) — bucket rolante
