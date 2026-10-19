@@ -2924,16 +2924,27 @@ impl Client {
             count: retry_count.max(1),
         };
 
+        // Node `sendMessagesAgain` (messages-recv.js:569-572): se o pedinte é o
+        // device primário (sem `:device`), reenvia para TODOS (`sendToAll`) —
+        // previne a falha de decriptação da primeira mensagem. Só o device
+        // secundário (com `:device`) recebe o retry 1:1 direcionado.
+        let send_to_all = jid_device(&retry_participant).map_or(true, |d| d == 0);
+
         let result = if baileys_core::is_jid_group(&target_jid) {
-            self.relay_group_message_retry(
-                &target_jid,
-                msg,
-                &msg_id,
-                &relay_participant,
-                sink,
-                &[],
-            )
-            .await
+            if send_to_all {
+                self.send_group(&target_jid, msg, &msg_id, sink, &[], None, true)
+                    .await
+            } else {
+                self.relay_group_message_retry(
+                    &target_jid,
+                    msg,
+                    &msg_id,
+                    &relay_participant,
+                    sink,
+                    &[],
+                )
+                .await
+            }
         } else {
             self.relay_message_retry(
                 &target_jid,
@@ -3805,7 +3816,7 @@ impl Client {
         sink: &WsSink,
         extra_attrs: &[(&str, &str)],
         participant: Option<&RelayParticipant>,
-        _is_retry: bool,
+        is_retry: bool,
     ) -> Result<SendMessageResult, ClientError> {
         let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
         let mut me_lid = self
@@ -3991,8 +4002,36 @@ impl Client {
             "SEND_GROUP: encryptGroupMessage (ciphertext + senderKeyDistributionMessage)"
         );
 
-        // (`_is_retry` sem participant cai no fanout normal, como no Node quando
-        // `sendToAll` é verdadeiro — o retry sem device do participante.)
+        // Retry `sendToAll` (device primário pedinte, sem `:device`): o Node
+        // reenvia o `skmsg` para todos com a MESMA sender key, sem redistribuir
+        // e sem `<participants>`/`device-identity` (messages-send.js `if (!isretry)`).
+        // Retorna cedo — o fanout abaixo é exclusivo do envio normal.
+        if is_retry {
+            let mut skmsg_enc = BinaryNode::new("enc")
+                .with_attr("v", "2")
+                .with_attr("type", "skmsg");
+            if let Some(mediatype) = get_media_type(&message) {
+                skmsg_enc = skmsg_enc.with_attr("mediatype", mediatype);
+            }
+
+            let mut stanza = BinaryNode::new("message")
+                .with_attr("id", msg_id)
+                .with_attr("type", get_message_type(&message))
+                .with_attr("to", jid)
+                .with_attr("addressing_mode", addressing_mode);
+            for &(k, v) in extra_attrs {
+                stanza = stanza.with_attr(k, v);
+            }
+            let stanza = stanza.with_children(vec![skmsg_enc.with_bytes(enc.ciphertext)]);
+
+            tracing::info!(msg_id, "SEND_GROUP: STANZA_SEND (retry sendToAll)\n{}", pretty_node(&stanza));
+            self.send_node(&stanza, sink).await?;
+            self.cache_send(msg_id.to_string(), jid.to_string(), message.encode_to_vec()).await;
+            return Ok(SendMessageResult { message_id: msg_id.to_string() });
+        }
+
+        // Fanout completo (envio normal): devices de todos os participantes
+        // (lid || id) + distribuição da sender key.
 
         // Devices de todos os participantes (lid || id).
         let participant_jids: Vec<String> = meta
@@ -4397,7 +4436,11 @@ impl Client {
                     && (my_lid_user != user || my_lid_device != device)
                     && (device == 0 || has_key_index)
                 {
-                    let key = (user.clone(), device, r.id.clone());
+                    // `jid` normalizado (paridade Node `extractDeviceJids`, que
+                    // guarda `userResult.id` — mas o log do Rust exibia `:0@lid`;
+                    // normalizar só afeta o campo de exibição/cache, o `sender_id`
+                    // é reconstruído de `user`+`device`+`server`).
+                    let key = (user.clone(), device, baileys_core::jid_normalized_user(&r.id));
                     if seen.insert(key.clone()) {
                         out.push(key.clone());
                         jid_devices.push(key);
