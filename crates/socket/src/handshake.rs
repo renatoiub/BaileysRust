@@ -1,6 +1,5 @@
 //! Nós de handshake — port de `Hineken/src/Utils/validate-connection.ts`.
 
-use baileys_core::constants::WA_VERSION;
 use baileys_core::ids::encode_big_endian;
 use baileys_proto::proto as wa;
 use baileys_store::creds::AuthenticationCreds;
@@ -8,14 +7,14 @@ use base64::Engine;
 use prost::Message;
 
 /// `generateLoginNode` — ClientPayload para login de dispositivo já registrado.
-pub fn generate_login_node(user_jid: &str, config: &ClientConfig) -> wa::ClientPayload {
+pub fn generate_login_node(user_jid: &str, config: &ClientConfig, wa_version: [u32; 3]) -> wa::ClientPayload {
     let decoded = baileys_core::jid_decode(user_jid);
     let (user, device) = match decoded {
         Some(d) => (d.user, d.device.unwrap_or(0)),
         None => (user_jid.trim_end_matches("@s.whatsapp.net").to_string(), 0),
     };
 
-    let mut payload = base_client_payload(config);
+    let mut payload = base_client_payload(config, wa_version);
     payload.passive = Some(true);
     payload.pull = Some(true);
     payload.username = Some(user.parse::<u64>().unwrap_or(0));
@@ -25,9 +24,13 @@ pub fn generate_login_node(user_jid: &str, config: &ClientConfig) -> wa::ClientP
 }
 
 /// `generateRegistrationNode` — ClientPayload de registro (novo dispositivo).
-pub fn generate_registration_node(creds: &AuthenticationCreds, config: &ClientConfig) -> wa::ClientPayload {
+pub fn generate_registration_node(
+    creds: &AuthenticationCreds,
+    config: &ClientConfig,
+    wa_version: [u32; 3],
+) -> wa::ClientPayload {
     let app_version_buf = baileys_crypto::md5(
-        WA_VERSION
+        wa_version
             .iter()
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
@@ -80,23 +83,23 @@ pub fn generate_registration_node(creds: &AuthenticationCreds, config: &ClientCo
         device_props: Some(device_props_bytes),
     };
 
-    let mut payload = base_client_payload(config);
+    let mut payload = base_client_payload(config, wa_version);
     payload.passive = Some(false);
     payload.pull = Some(false);
     payload.device_pairing_data = Some(pairing_data);
     payload
 }
 
-fn base_client_payload(config: &ClientConfig) -> wa::ClientPayload {
+fn base_client_payload(config: &ClientConfig, wa_version: [u32; 3]) -> wa::ClientPayload {
     wa::ClientPayload {
         username: None,
         passive: None,
         user_agent: Some(wa::client_payload::UserAgent {
             platform: Some(wa::client_payload::user_agent::Platform::Web as i32),
             app_version: Some(wa::client_payload::user_agent::AppVersion {
-                primary: Some(WA_VERSION[0]),
-                secondary: Some(WA_VERSION[1]),
-                tertiary: Some(WA_VERSION[2]),
+                primary: Some(wa_version[0]),
+                secondary: Some(wa_version[1]),
+                tertiary: Some(wa_version[2]),
                 quaternary: None,
                 quinary: None,
             }),

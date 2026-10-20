@@ -446,6 +446,9 @@ pub struct Client {
     last_close_code: AtomicI32,
     /// `true` entre o `connection: "open"` e o `connection: "close"`.
     open: std::sync::atomic::AtomicBool,
+    /// Versão do WhatsApp Web do handshake (`version` do `makeWASocket`);
+    /// vale a partir da próxima conexão.
+    wa_version: std::sync::RwLock<[u32; 3]>,
     /// Handle da task de rotação de QR (para cancelar ao parear).
     qr_rotation: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Cache de envio: `msg_id` → `(destino, Message codificado)` para o
@@ -519,6 +522,7 @@ impl Client {
             noise: Mutex::new(None),
             last_close_code: AtomicI32::new(0),
             open: std::sync::atomic::AtomicBool::new(false),
+            wa_version: std::sync::RwLock::new(baileys_core::constants::WA_VERSION),
             qr_rotation: Mutex::new(None),
             send_cache: Mutex::new(HashMap::new()),
             send_cache_order: Mutex::new(Vec::new()),
@@ -582,6 +586,16 @@ impl Client {
     /// Último código de desconexão (0 = nunca desconectou).
     pub fn last_close_code(&self) -> i32 {
         self.last_close_code.load(Ordering::SeqCst)
+    }
+
+    /// Versão do WhatsApp Web usada no próximo handshake.
+    pub fn wa_version(&self) -> [u32; 3] {
+        *self.wa_version.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Troca a versão do WhatsApp Web; vale a partir da próxima conexão.
+    pub fn set_wa_version(&self, version: [u32; 3]) {
+        *self.wa_version.write().unwrap_or_else(|e| e.into_inner()) = version;
     }
 
     /// Conexão logada e aberta (`connection: "open"` sem `close` depois).
@@ -794,9 +808,10 @@ impl Client {
                     let key_enc = n.process_handshake(&server_hello, &noise_key).await?;
 
                     let creds = self.store.creds();
+                    let wa_version = self.wa_version();
                     let payload = match &creds.me {
-                        Some(me) => generate_login_node(&me.id, &self.config),
-                        None => generate_registration_node(&creds, &self.config),
+                        Some(me) => generate_login_node(&me.id, &self.config, wa_version),
+                        None => generate_registration_node(&creds, &self.config, wa_version),
                     };
                     let payload_enc = n.encrypt(&payload.encode_to_vec())?;
 
