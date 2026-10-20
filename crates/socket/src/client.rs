@@ -1044,6 +1044,12 @@ impl Client {
             return Ok(());
         }
 
+        // `CB:ack,class:message` → `handleBadAck`.
+        if tag == "ack" && node.attr("class") == Some("message") {
+            self.handle_bad_ack(node, sink).await?;
+            return Ok(());
+        }
+
         // Mensagem de entrada.
         if tag == "message" {
             if let Err(e) = self.handle_message(node, sink).await {
@@ -2345,6 +2351,48 @@ impl Client {
         }
     }
 
+    /// `handleBadAck`: ack de mensagem enviada com `error` vira
+    /// `messages.update { status: ERROR, messageStubParameters: [error] }`.
+    async fn handle_bad_ack(&self, node: &BinaryNode, sink: &WsSink) -> Result<(), ClientError> {
+        if let Some(error) = node.attr("error") {
+            let key = MessageUpdateKey {
+                remote_jid: node.attr("from").unwrap_or_default().to_string(),
+                id: node.attr("id").unwrap_or_default().to_string(),
+                from_me: true,
+                ..Default::default()
+            };
+            let error_update = |parameters: Vec<String>| MessageStatusUpdate {
+                key: key.clone(),
+                update: MessageUpdateData {
+                    status: Some(wa::web_message_info::Status::Error as i32),
+                    message_stub_parameters: parameters,
+                    ..Default::default()
+                },
+            };
+            match error {
+                // `MissingTcToken`: o Node também consulta o reachout timelock.
+                "463" => {
+                    let _ = self.events.send(ClientEvent::MessagesUpdate {
+                        updates: vec![error_update(vec![
+                            error.to_string(),
+                            "Your account has been restricted".to_string(),
+                        ])],
+                    });
+                }
+                "479" => tracing::warn!(
+                    msg_id = %key.id,
+                    from = %key.remote_jid,
+                    "smax-invalid (479): stanza rejected by server — likely stale device session or malformed addressing"
+                ),
+                _ => tracing::warn!(?node.attrs, "received error in ack"),
+            }
+            let _ = self.events.send(ClientEvent::MessagesUpdate {
+                updates: vec![error_update(vec![error.to_string()])],
+            });
+        }
+        self.send_message_ack(node, sink).await
+    }
+
     /// `shouldIgnoreJid` do container (`ignoreGroups`).
     fn should_ignore_jid(&self, jid: &str) -> bool {
         if !self.config.ignore_groups || jid.is_empty() {
@@ -3459,6 +3507,11 @@ impl Client {
             };
             let from_me = recipient.is_none()
                 || ((receipt_type == "retry" || receipt_type == "sender") && is_node_from_me);
+            // O `from` do receipt traz o device de quem leu/recebeu
+            // (`user:77@lid`); o webhook espera o chat sem device.
+            let remote = Some(baileys_core::jid_normalized_user(&remote))
+                .filter(|r| !r.is_empty())
+                .unwrap_or(remote);
 
             let status = get_status_from_receipt_type(node.attr("type"));
 
