@@ -57,7 +57,10 @@ pub struct ChatUpdate {
     pub id: String,
     pub archived: Option<bool>,
     pub unread_count: Option<i32>,
-    pub pinned: Option<u32>,
+    /// Timestamp (ms) do pin no app-state; `None` = não fixado.
+    pub pinned: Option<i64>,
+    /// `muteEndTime` do app-state; `None` = sem mute.
+    pub mute_end_time: Option<i64>,
     pub name: Option<String>,
     pub read_only: Option<bool>,
     pub ephemeral_expiration: Option<u32>,
@@ -182,6 +185,9 @@ pub struct MessageUpdateData {
     /// `update.key` do REVOKE (`key: message.key`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<MessageUpdateKey>,
+    /// `starAction` do app-state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starred: Option<bool>,
 }
 
 /// Atualização de status de mensagem (espelha `messages.update`).
@@ -481,6 +487,10 @@ pub struct Client {
     send_active_receipts: std::sync::atomic::AtomicBool,
     /// Cache do `fetchPrivacySettings`.
     privacy_settings: Mutex<Option<HashMap<String, String>>>,
+    /// `pendingAppStateSync` do `upsertMessage` (history sync sem `myAppStateKeyId`).
+    pending_app_state_sync: std::sync::atomic::AtomicBool,
+    /// Serializa o `resyncAppState` (o Node roda dentro de `keys.transaction`).
+    app_state_mutex: Mutex<()>,
 }
 
 impl Client {
@@ -522,6 +532,8 @@ impl Client {
             patch_message_fn: std::sync::Mutex::new(None),
             send_active_receipts: std::sync::atomic::AtomicBool::new(false),
             privacy_settings: Mutex::new(None),
+            pending_app_state_sync: std::sync::atomic::AtomicBool::new(false),
+            app_state_mutex: Mutex::new(()),
         })
     }
 
@@ -1069,6 +1081,19 @@ impl Client {
                 match node.attr("type") {
                     Some("w:gp2") => self.handle_group_notification(node).await,
                     Some("devices") => self.handle_devices_notification(node, sink).await,
+                    Some("server_sync") => {
+                        // `resyncAppState([name], false)` — fora do loop de leitura (faz query).
+                        if let Some(name) = node.child("collection").and_then(|c| c.attr("name")) {
+                            let name = name.to_string();
+                            let client = self.clone();
+                            let sink = sink.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = client.resync_app_state(&[name.as_str()], false, &sink).await {
+                                    tracing::warn!(error = %e, name, "server_sync resync falhou");
+                                }
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1175,7 +1200,8 @@ impl Client {
             id: from,
             archived: node.attr("archive").and_then(|v| v.parse::<bool>().ok()),
             unread_count: node.attr("count").and_then(|v| v.parse::<i32>().ok()),
-            pinned: node.attr("pin").and_then(|v| v.parse::<u32>().ok()),
+            pinned: node.attr("pin").and_then(|v| v.parse::<i64>().ok()),
+            mute_end_time: None,
             name: node.attr("name").map(String::from),
             read_only: node.attr("read_only").and_then(|v| v.parse::<bool>().ok()),
             ephemeral_expiration: node
@@ -1962,7 +1988,324 @@ impl Client {
         tracing::debug!(from = %from, msg_id = %msg_id, "evento Message emitido");
 
         self.process_message(&info, &key_extras, sink).await;
+        self.maybe_sync_app_state(&info, sink);
         Ok(())
+    }
+
+    /// Gatilhos do `upsertMessage`: history sync com `myAppStateKeyId` →
+    /// `doAppStateSync`; sem chave → `pendingAppStateSync`; e o
+    /// `appStateSyncKeyShare` libera o sync pendente.
+    fn maybe_sync_app_state(self: &Arc<Self>, info: &wa::WebMessageInfo, sink: &WsSink) {
+        let Some(message) = info.message.as_ref() else {
+            return;
+        };
+        let is_history = normalize_message_content(message)
+            .protocol_message
+            .as_ref()
+            .and_then(|p| p.history_sync_notification.as_ref())
+            .is_some();
+        let has_key = self.store.creds().my_app_state_key_id.is_some();
+
+        let mut should_sync = false;
+        if is_history && !has_key {
+            tracing::warn!("skipping app state sync, as myAppStateKeyId is not set");
+            self.pending_app_state_sync.store(true, Ordering::Relaxed);
+        }
+        if is_history && has_key {
+            self.pending_app_state_sync.store(false, Ordering::Relaxed);
+            should_sync = true;
+        }
+        let is_key_share = message
+            .protocol_message
+            .as_ref()
+            .and_then(|p| p.app_state_sync_key_share.as_ref())
+            .is_some();
+        if is_key_share && self.pending_app_state_sync.swap(false, Ordering::Relaxed) {
+            should_sync = true;
+        }
+
+        if should_sync {
+            let client = self.clone();
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                client.do_app_state_sync(&sink).await;
+            });
+        }
+    }
+
+    /// `doAppStateSync`: sync inicial de todas as coleções (só uma vez,
+    /// controlado pelo `accountSyncCounter`).
+    async fn do_app_state_sync(self: &Arc<Self>, sink: &WsSink) {
+        if self.store.creds().account_sync_counter != 0 {
+            return;
+        }
+        tracing::info!("doing initial app state sync");
+        match self.resync_app_state(&crate::app_state::ALL_WA_PATCH_NAMES, true, sink).await {
+            Ok(()) => {
+                let mut creds = self.store.creds();
+                creds.account_sync_counter += 1;
+                if self.store.update_creds(creds.clone()).is_ok() {
+                    let _ = self.events.send(ClientEvent::CredsUpdate(creds));
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "initial app state sync falhou"),
+        }
+    }
+
+    /// `getAppStateSyncKey` — `keyData` gravado em `app-state-sync-key`.
+    fn app_state_sync_key(&self, key_id: &str) -> Option<Vec<u8>> {
+        let raw = self.store.load_generic("app-state-sync-key", key_id)?;
+        crate::app_state::app_state_sync_key_data(&raw)
+    }
+
+    fn load_app_state_version(&self, name: &str) -> Option<crate::app_state::LtHashState> {
+        let raw = self.store.load_generic("app-state-sync-version", name)?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    fn save_app_state_version(&self, name: &str, state: &crate::app_state::LtHashState) {
+        if let Ok(json) = serde_json::to_string(state) {
+            self.store.store_generic("app-state-sync-version", name, &json);
+        }
+    }
+
+    /// `resyncAppState` (Hineken `chats.ts`): busca snapshot/patches de cada
+    /// coleção até não haver mais, decodifica e aplica as mutações.
+    pub async fn resync_app_state(
+        self: &Arc<Self>,
+        collections: &[&str],
+        is_initial_sync: bool,
+        sink: &WsSink,
+    ) -> Result<(), ClientError> {
+        use crate::app_state::{self as app_state, MutationMap};
+        let _guard = self.app_state_mutex.lock().await;
+
+        let mut initial_version_map: HashMap<String, u64> = HashMap::new();
+        let mut global_mutation_map = MutationMap::default();
+        let mut collections_to_handle: Vec<String> = Vec::new();
+        for name in collections {
+            if !collections_to_handle.iter().any(|c| c == name) {
+                collections_to_handle.push(name.to_string());
+            }
+        }
+        let mut attempts_map: HashMap<String, u32> = HashMap::new();
+
+        while !collections_to_handle.is_empty() {
+            let mut states: HashMap<String, app_state::LtHashState> = HashMap::new();
+            let mut nodes = Vec::new();
+            for name in &collections_to_handle {
+                let state = match self.load_app_state_version(name) {
+                    Some(state) => {
+                        initial_version_map.entry(name.clone()).or_insert(state.version);
+                        state
+                    }
+                    None => app_state::LtHashState::new(),
+                };
+                tracing::info!("resyncing {name} from v{}", state.version);
+                nodes.push(
+                    BinaryNode::new("collection")
+                        .with_attr("name", name.as_str())
+                        .with_attr("version", state.version.to_string())
+                        .with_attr("return_snapshot", (state.version == 0).to_string()),
+                );
+                states.insert(name.clone(), state);
+            }
+
+            let query = BinaryNode::new("iq")
+                .with_attr("to", S_WHATSAPP_NET)
+                .with_attr("xmlns", "w:sync:app:state")
+                .with_attr("type", "set")
+                .with_attr("id", self.next_tag())
+                .with_children(vec![BinaryNode::new("sync").with_children(nodes)]);
+            let result = self.query_node(query, sink).await?;
+
+            let decoded = app_state::parse_syncd_collections(&result)
+                .map_err(|e| ClientError::InvalidParams(e.to_string()))?;
+            if decoded.is_empty() {
+                break;
+            }
+
+            let get_key = |id: &str| self.app_state_sync_key(id);
+            for collection in decoded {
+                let name = collection.name.clone();
+                let has_more_patches = collection.has_more_patches;
+                let outcome: Result<(), app_state::AppStateError> = async {
+                    if let Some(snapshot_ref) = &collection.snapshot_ref {
+                        let data = app_state::download_external_blob(snapshot_ref).await?;
+                        let snapshot = wa::SyncdSnapshot::decode(data.as_slice())
+                            .map_err(|e| app_state::AppStateError::Invalid(e.to_string()))?;
+                        let (new_state, mutation_map) = app_state::decode_syncd_snapshot(
+                            &name,
+                            &snapshot,
+                            &get_key,
+                            initial_version_map.get(&name).copied(),
+                            app_state::VALIDATE_SNAPSHOT_MACS,
+                        )?;
+                        tracing::info!("restored state of {name} from snapshot to v{} with mutations", new_state.version);
+                        self.save_app_state_version(&name, &new_state);
+                        states.insert(name.clone(), new_state);
+                        global_mutation_map.extend(mutation_map);
+                    }
+
+                    if !collection.patches.is_empty() {
+                        let mut patches = collection.patches.clone();
+                        for patch in patches.iter_mut() {
+                            if let Some(external) = patch.external_mutations.clone() {
+                                let downloaded = app_state::download_external_patch(&external).await?;
+                                patch.mutations.extend(downloaded.mutations);
+                            }
+                        }
+                        let current = states.get(&name).cloned().unwrap_or_default();
+                        let (new_state, mutation_map) = app_state::decode_patches(
+                            &name,
+                            &patches,
+                            &current,
+                            &get_key,
+                            initial_version_map.get(&name).copied(),
+                            app_state::VALIDATE_PATCH_SNAPSHOT_MACS,
+                        )?;
+                        self.save_app_state_version(&name, &new_state);
+                        tracing::info!("synced {name} to v{}", new_state.version);
+                        initial_version_map.insert(name.clone(), new_state.version);
+                        states.insert(name.clone(), new_state);
+                        global_mutation_map.extend(mutation_map);
+                    }
+                    Ok(())
+                }
+                .await;
+
+                match outcome {
+                    Ok(()) => {
+                        if has_more_patches {
+                            tracing::info!("{name} has more patches...");
+                        } else {
+                            collections_to_handle.retain(|c| c != &name);
+                        }
+                    }
+                    Err(error) => {
+                        let attempts = attempts_map.get(&name).copied().unwrap_or(0);
+                        let irrecoverable = attempts >= app_state::MAX_SYNC_ATTEMPTS || error.is_key_not_found();
+                        tracing::info!(
+                            name,
+                            error = %error,
+                            "failed to sync state from version{}",
+                            if irrecoverable { "" } else { ", removing and trying from scratch" }
+                        );
+                        self.store.remove_generic("app-state-sync-version", &name);
+                        attempts_map.insert(name.clone(), attempts + 1);
+                        if irrecoverable {
+                            collections_to_handle.retain(|c| c != &name);
+                        }
+                    }
+                }
+            }
+        }
+
+        for mutation in global_mutation_map.into_mutations() {
+            self.process_sync_action(&mutation, is_initial_sync, sink).await;
+        }
+        Ok(())
+    }
+
+    /// `processSyncAction` (Hineken `chat-utils.ts`).
+    async fn process_sync_action(
+        &self,
+        mutation: &crate::app_state::ChatMutation,
+        is_initial_sync: bool,
+        sink: &WsSink,
+    ) {
+        let Some(action) = mutation.sync_action.value.as_ref() else {
+            tracing::debug!(index = ?mutation.index, "unprocessable update");
+            return;
+        };
+        let index_at = |i: usize| mutation.index.get(i).cloned().unwrap_or_default();
+        let (r#type, id, msg_id, from_me) = (index_at(0), index_at(1), index_at(2), index_at(3));
+
+        if let Some(mute) = &action.mute_action {
+            let _ = self.events.send(ClientEvent::ChatsUpdate {
+                chats: vec![ChatUpdate {
+                    id,
+                    mute_end_time: if mute.muted.unwrap_or(false) { mute.mute_end_timestamp } else { None },
+                    ..Default::default()
+                }],
+            });
+        } else if action.archive_chat_action.is_some() || r#type == "archive" || r#type == "unarchive" {
+            let archived = match &action.archive_chat_action {
+                Some(a) => a.archived.unwrap_or(false),
+                None => r#type == "archive",
+            };
+            let _ = self.events.send(ClientEvent::ChatsUpdate {
+                chats: vec![ChatUpdate { id, archived: Some(archived), ..Default::default() }],
+            });
+        } else if let Some(mark_read) = &action.mark_chat_as_read_action {
+            let read = mark_read.read.unwrap_or(false);
+            // No sync inicial, "lido" é o padrão: não emite unreadCount.
+            let unread_count = if is_initial_sync && read {
+                None
+            } else if read {
+                Some(0)
+            } else {
+                Some(-1)
+            };
+            let _ = self.events.send(ClientEvent::ChatsUpdate {
+                chats: vec![ChatUpdate { id, unread_count, ..Default::default() }],
+            });
+        } else if action.delete_message_for_me_action.is_some() || r#type == "deleteMessageForMe" {
+            tracing::debug!(id, msg_id, from_me, "messages.delete (app-state)");
+        } else if let Some(contact) = &action.contact_action {
+            let _ = self.events.send(ClientEvent::ContactsUpsert {
+                contacts: vec![ContactUpsert {
+                    id: id.clone(),
+                    name: contact.full_name.clone(),
+                    lid: contact.lid_jid.clone().filter(|l| !l.is_empty()),
+                    jid: is_jid_user(&id).then(|| id.clone()),
+                    ..Default::default()
+                }],
+            });
+        } else if let Some(push_name) = &action.push_name_setting {
+            if let Some(name) = push_name.name.as_deref().filter(|n| !n.is_empty()) {
+                self.set_me_name(name, sink).await;
+            }
+        } else if let Some(pin) = &action.pin_action {
+            let _ = self.events.send(ClientEvent::ChatsUpdate {
+                chats: vec![ChatUpdate {
+                    id,
+                    pinned: if pin.pinned.unwrap_or(false) { mutation.sync_action.value.as_ref().and_then(|v| v.timestamp) } else { None },
+                    ..Default::default()
+                }],
+            });
+        } else if let Some(setting) = &action.unarchive_chats_setting {
+            let unarchive_chats = setting.unarchive_chats.unwrap_or(false);
+            let mut creds = self.store.creds();
+            if !creds.account_settings.is_object() {
+                creds.account_settings = serde_json::json!({});
+            }
+            if let Some(obj) = creds.account_settings.as_object_mut() {
+                obj.insert("unarchiveChats".to_string(), serde_json::Value::Bool(unarchive_chats));
+            }
+            if self.store.update_creds(creds.clone()).is_ok() {
+                let _ = self.events.send(ClientEvent::CredsUpdate(creds));
+            }
+            tracing::info!("archive setting updated => '{unarchive_chats}'");
+        } else if action.star_action.is_some() || r#type == "star" {
+            let starred = action
+                .star_action
+                .as_ref()
+                .and_then(|s| s.starred)
+                .unwrap_or_else(|| mutation.index.last().map(String::as_str) == Some("1"));
+            let _ = self.events.send(ClientEvent::MessagesUpdate {
+                updates: vec![MessageStatusUpdate {
+                    key: MessageUpdateKey { remote_jid: id, id: msg_id, from_me: from_me == "1", ..Default::default() },
+                    update: MessageUpdateData { starred: Some(starred), ..Default::default() },
+                }],
+            });
+        } else if action.delete_chat_action.is_some() || r#type == "deleteChat" {
+            if !is_initial_sync {
+                let _ = self.events.send(ClientEvent::ChatsDelete { jids: vec![id] });
+            }
+        } else {
+            tracing::debug!(id, index = ?mutation.index, "unprocessable update");
+        }
     }
 
     /// `upsertMessage` ("update our pushname too") + hook `creds.update` do
@@ -1976,21 +2319,27 @@ impl Client {
         if !from_me {
             return;
         }
+        self.set_me_name(push_name, sink).await;
+    }
+
+    /// `creds.update({ me: { ...me, name } })` + hook do socket: grava o nome
+    /// e, se mudou, envia `<presence name>`.
+    async fn set_me_name(&self, name: &str, sink: &WsSink) {
         let mut creds = self.store.creds();
         let Some(me) = creds.me.as_mut() else {
             return;
         };
-        if me.name.as_deref() == Some(push_name) {
+        if me.name.as_deref() == Some(name) {
             return;
         }
-        me.name = Some(push_name.to_string());
+        me.name = Some(name.to_string());
         if let Err(e) = self.store.update_creds(creds.clone()) {
             tracing::warn!(error = %e, "falha ao gravar pushName no creds");
             return;
         }
         let _ = self.events.send(ClientEvent::CredsUpdate(creds));
-        tracing::debug!(name = push_name, "updated pushName");
-        let presence = BinaryNode::new("presence").with_attr("name", push_name);
+        tracing::debug!(name, "updated pushName");
+        let presence = BinaryNode::new("presence").with_attr("name", name);
         if let Err(e) = self.send_node(&presence, sink).await {
             tracing::warn!(error = %e, "error in sending presence update on name change");
         }
@@ -2287,6 +2636,40 @@ impl Client {
                     client.process_history_sync_notification(&notification).await;
                 });
             }
+        } else if r#type == Type::AppStateSyncKeyShare as i32 {
+            let keys = protocol
+                .app_state_sync_key_share
+                .as_ref()
+                .map(|s| s.keys.as_slice())
+                .unwrap_or_default();
+            if keys.is_empty() {
+                tracing::info!("recv app state sync with 0 keys");
+                return;
+            }
+            let mut new_key_id = String::new();
+            let mut new_keys = Vec::new();
+            for app_key in keys {
+                let Some(key_id) = app_key.key_id.as_ref().and_then(|k| k.key_id.as_deref()) else {
+                    continue;
+                };
+                let str_key_id = crate::app_state::app_state_key_id_b64(key_id);
+                let data = app_key.key_data.clone().unwrap_or_default();
+                self.store.store_generic(
+                    "app-state-sync-key",
+                    &str_key_id,
+                    &crate::app_state::app_state_sync_key_json(&data),
+                );
+                new_keys.push(str_key_id.clone());
+                new_key_id = str_key_id;
+            }
+            tracing::info!(new_app_state_sync_key_id = %new_key_id, ?new_keys, "injecting new app state sync keys");
+            if !new_key_id.is_empty() {
+                let mut creds = self.store.creds();
+                creds.my_app_state_key_id = Some(new_key_id);
+                if self.store.update_creds(creds.clone()).is_ok() {
+                    let _ = self.events.send(ClientEvent::CredsUpdate(creds));
+                }
+            }
         } else if r#type == Type::Revoke as i32 {
             let envelope = MessageUpdateKey::from_envelope(key, key_extras, key.id.clone().unwrap_or_default());
             let _ = self.events.send(ClientEvent::MessagesUpdate {
@@ -2536,25 +2919,19 @@ impl Client {
 
         // ciphertext || mac(32) — remove o tail de MAC e alinha a 16 bytes.
         let body = &bytes[..(bytes.len() / 16) * 16];
-        let mut data = baileys_crypto::aes_decrypt_cbc(body, cipher_key, iv).ok()?;
+        // `aes_decrypt_cbc` já remove o PKCS7 (como o `aes.final()` do Node).
+        let data = baileys_crypto::aes_decrypt_cbc(body, cipher_key, iv).ok()?;
 
-        // Remove padding PKCS7 (o Baileys usa `unpadRandomMax16` no path
-        // inline; o download do history usa PKCS7 padrão do AES-CBC).
-        if let Some(&pad) = data.last() {
-            if (1..=16).contains(&pad) && data.len() >= pad as usize {
-                data.truncate(data.len() - pad as usize);
-            }
-        }
-
-        // Gzip?
-        let decoded: Vec<u8> = if data.len() > 2 && data[0] == 0x1f && data[1] == 0x8b {
+        // `inflatePromise(buffer)` do Node (zlib); gzip mantido por compatibilidade.
+        let decoded: Vec<u8> = {
             use std::io::Read;
-            let mut decoder = flate2::read::GzDecoder::new(data.as_slice());
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out).ok()?;
+            if data.len() > 2 && data[0] == 0x1f && data[1] == 0x8b {
+                flate2::read::GzDecoder::new(data.as_slice()).read_to_end(&mut out).ok()?;
+            } else {
+                flate2::read::ZlibDecoder::new(data.as_slice()).read_to_end(&mut out).ok()?;
+            }
             out
-        } else {
-            data
         };
 
         wa::HistorySync::decode(decoded.as_slice()).ok()
