@@ -13,7 +13,7 @@ pub mod usync;
 pub use cache::{CacheStore, TtlCache};
 pub use client::{
     CallInfo, ChatUpdate, Client, ClientError, ClientEvent, ConnectionUpdate, ContactUpsert,
-    DebugRetryParams, GroupParticipantsUpdate, GroupUpdate, MediaUpload, MessageKeyExtras,
+    DebugRetryParams, GroupParticipantInfo, GroupParticipantsUpdate, GroupUpdate, MediaUpload, MessageKeyExtras,
     MessageReceiptUpdate, MessageReaction, MessageStatusUpdate, MessageUpdateData, MessageUpdateKey,
     MessagingHistorySet, PresenceData, RelayParticipant, SendMessageResult, UserReceipt, WsSink,
 };

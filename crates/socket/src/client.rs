@@ -78,27 +78,48 @@ pub struct ContactUpsert {
 
 /// Atualização de grupo (espelha `groups.update`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GroupUpdate {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub desc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub announce: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub restrict: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub invite_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub member_add_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub join_approval_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub suspended: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delete_reason: Option<String>,
+}
+
+/// Participante do `group-participants.update` (`{ jid, phone_number }`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct GroupParticipantInfo {
+    pub jid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone_number: Option<String>,
 }
 
 /// Atualização de participantes de grupo (espelha `group-participants.update`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct GroupParticipantsUpdate {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
-    pub participants: Vec<String>,
+    pub participants: Vec<GroupParticipantInfo>,
     pub action: String,
 }
 
@@ -111,6 +132,37 @@ pub struct MessageUpdateKey {
     pub from_me: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub participant: Option<String>,
+    /// Extras do `WAMessageKey` do Hineken (`...message.key`), em snake_case como no Node.
+    #[serde(rename = "sender_lid", skip_serializing_if = "Option::is_none")]
+    pub sender_lid: Option<String>,
+    #[serde(rename = "participant_pn", skip_serializing_if = "Option::is_none")]
+    pub participant_pn: Option<String>,
+    #[serde(rename = "participant_lid", skip_serializing_if = "Option::is_none")]
+    pub participant_lid: Option<String>,
+    #[serde(rename = "sender_pn", skip_serializing_if = "Option::is_none")]
+    pub sender_pn: Option<String>,
+    #[serde(rename = "peer_recipient_pn", skip_serializing_if = "Option::is_none")]
+    pub peer_recipient_pn: Option<String>,
+    #[serde(rename = "peer_recipient_lid", skip_serializing_if = "Option::is_none")]
+    pub peer_recipient_lid: Option<String>,
+}
+
+impl MessageUpdateKey {
+    /// `{ ...message.key, id }` — key do envelope (já limpa) com outro id.
+    fn from_envelope(key: &wa::MessageKey, extras: &MessageKeyExtras, id: String) -> Self {
+        Self {
+            remote_jid: key.remote_jid.clone().unwrap_or_default(),
+            id,
+            from_me: key.from_me.unwrap_or(false),
+            participant: key.participant.clone(),
+            sender_lid: extras.sender_lid.clone(),
+            participant_pn: extras.participant_pn.clone(),
+            participant_lid: extras.participant_lid.clone(),
+            sender_pn: extras.sender_pn.clone(),
+            peer_recipient_pn: extras.peer_recipient_pn.clone(),
+            peer_recipient_lid: extras.peer_recipient_lid.clone(),
+        }
+    }
 }
 
 /// `update` do `messages.update` (espelha `WAMessageUpdate.update`).
@@ -125,6 +177,11 @@ pub struct MessageUpdateData {
     pub message_stub_parameters: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_timestamp: Option<u64>,
+    /// `update.key` do REVOKE (`key: message.key`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<MessageUpdateKey>,
 }
 
 /// Atualização de status de mensagem (espelha `messages.update`).
@@ -189,6 +246,19 @@ pub struct CallInfo {
     pub is_video: bool,
     pub is_group: bool,
     pub group_jid: Option<String>,
+}
+
+/// `NO_MESSAGE_FOUND_ERROR_TEXT` do Hineken.
+const NO_MESSAGE_FOUND_ERROR_TEXT: &str = "Message absent from node";
+
+/// Retorno do `decodeMessageNode`: `fullMessage` (key crua), `author`,
+/// `sender` (`author` em chat 1:1, `chatId` nos demais) e `category`.
+struct DecodedMessageNode {
+    full: wa::WebMessageInfo,
+    author: String,
+    sender: String,
+    key_extras: MessageKeyExtras,
+    category: Option<String>,
 }
 
 /// Campos extras do `key` que não existem no proto `MessageKey`
@@ -256,6 +326,9 @@ pub enum ClientEvent {
     /// `call` — eventos de chamada (parsed para webhook + nós brutos para
     /// o CallManager/player bridge).
     Call { calls: Vec<CallInfo>, raw_nodes: Vec<BinaryNode> },
+    /// `CB:receipt` com `type=retry` (nó bruto) — o app pode montar o
+    /// `retryRelay` como o container Node.
+    RetryReceipt { node: BinaryNode },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -346,6 +419,9 @@ pub type LoadMessageFn = Arc<
     dyn Fn(String, String) -> futures_util::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync,
 >;
 
+/// `patchMessageBeforeSending` do `SocketConfig` (default: identidade).
+pub type PatchMessageFn = Arc<dyn Fn(wa::Message) -> wa::Message + Send + Sync>;
+
 /// Cliente do socket WhatsApp.
 pub struct Client {
     store: Arc<SqliteSignalStore>,
@@ -399,6 +475,12 @@ pub struct Client {
     save_message_fn: Mutex<Option<SaveMessageFn>>,
     /// Callback de recuperação de mensagem enviada (fornecido pelo app).
     load_message_fn: Mutex<Option<LoadMessageFn>>,
+    /// `patchMessageBeforeSending` (fornecido pelo app).
+    patch_message_fn: std::sync::Mutex<Option<PatchMessageFn>>,
+    /// `sendActiveReceipts` — segue o `isOnline` do `sendPresenceUpdate`.
+    send_active_receipts: std::sync::atomic::AtomicBool,
+    /// Cache do `fetchPrivacySettings`.
+    privacy_settings: Mutex<Option<HashMap<String, String>>>,
 }
 
 impl Client {
@@ -437,6 +519,9 @@ impl Client {
             group_meta_cache: TtlCache::new(Duration::from_secs(3600), 1000),
             save_message_fn: Mutex::new(None),
             load_message_fn: Mutex::new(None),
+            patch_message_fn: std::sync::Mutex::new(None),
+            send_active_receipts: std::sync::atomic::AtomicBool::new(false),
+            privacy_settings: Mutex::new(None),
         })
     }
 
@@ -486,6 +571,18 @@ impl Client {
     pub async fn set_message_store(&self, save: SaveMessageFn, load: LoadMessageFn) {
         *self.save_message_fn.lock().await = Some(save);
         *self.load_message_fn.lock().await = Some(load);
+    }
+
+    /// Define o `patchMessageBeforeSending` (aplicado como no `relayMessage`).
+    pub fn set_patch_message(&self, patch: PatchMessageFn) {
+        *self.patch_message_fn.lock().unwrap() = Some(patch);
+    }
+
+    fn patch_message(&self, message: &wa::Message) -> wa::Message {
+        match self.patch_message_fn.lock().unwrap().clone() {
+            Some(patch) => patch(message.clone()),
+            None => message.clone(),
+        }
     }
 
     /// Registra uma extensão de armazenamento de chaves de sinal (ex. Redis
@@ -967,6 +1064,14 @@ impl Client {
                     }
                 });
             }
+            // `processNotification` por `type` (o ack sai no `finally`).
+            if tag == "notification" {
+                match node.attr("type") {
+                    Some("w:gp2") => self.handle_group_notification(node).await,
+                    Some("devices") => self.handle_devices_notification(node, sink).await,
+                    _ => {}
+                }
+            }
             self.handle_encrypt_notification(node, sink, noise).await?;
             return Ok(());
         }
@@ -997,12 +1102,6 @@ impl Client {
         // `ClientEvent::Call` para o webhook e o call-player.
         if tag == "call" {
             self.handle_call_node(node);
-            return Ok(());
-        }
-
-        // Notificação de grupo (w:gp2) — criação/edição/participantes.
-        if tag == "notification" && node.attr("type") == Some("w:gp2") {
-            self.handle_group_notification(node);
             return Ok(());
         }
 
@@ -1145,103 +1244,235 @@ impl Client {
 
     /// Port de `groups.upsert`/`groups.update`/`group-participants.update`
     /// a partir de notificações `w:gp2`.
-    fn handle_group_notification(&self, node: &BinaryNode) {
-        let from = node.attr("from").unwrap_or_default().to_string();
+    /// `handleGroupNotification` + ramo `messageStubType` do `processMessage`
+    /// (Hineken): eventos de grupo e manutenção do `groupMetaCache`.
+    async fn handle_group_notification(&self, node: &BinaryNode) {
+        let jid = baileys_core::jid_normalized_user(node.attr("from").unwrap_or_default());
         let participant = node.attr("participant").map(String::from);
-
-        if let Some(create) = node.child("create") {
-            let group_json = self.group_node_to_json(create, &from);
-            let _ = self.events.send(ClientEvent::GroupsUpsert {
-                groups: vec![group_json],
-            });
+        let Some(child) = (match &node.content {
+            Some(BinaryContent::Children(children)) => children.first(),
+            _ => None,
+        }) else {
             return;
-        }
-
-        // Filhos de update: subject, description, etc.
-        let mut update = GroupUpdate {
-            id: from.clone(),
-            author: participant.clone(),
-            ..Default::default()
         };
-        let mut has_update = false;
-        if let Some(subject) = node.child("subject") {
-            update.subject = Some(subject.attr("subject").unwrap_or_default().to_string());
-            update.author = subject.attr("participant").map(String::from).or(participant.clone());
-            has_update = true;
-        }
-        if let Some(desc) = node.child("description") {
-            update.desc = Some(desc.content_text());
-            update.author = desc.attr("participant").map(String::from).or(participant.clone());
-            has_update = true;
-        }
-        if let Some(announce) = node.child("announcement") {
-            update.announce = Some(true);
-            update.author = announce.attr("participant").map(String::from).or(participant.clone());
-            has_update = true;
-        }
-        if let Some(restrict) = node.child("locked") {
-            update.restrict = Some(true);
-            update.author = restrict.attr("participant").map(String::from).or(participant.clone());
-            has_update = true;
-        }
-        if let Some(code) = node.child("invite") {
-            update.invite_code = code.attr("code").map(String::from);
-            has_update = true;
-        }
-        if let Some(code) = node.child("code") {
-            update.invite_code = code.attr("code").map(String::from);
-            has_update = true;
-        }
-        if let Some(del) = node.child("delete") {
-            update.deleted = Some(true);
-            update.author = del.attr("participant").map(String::from).or(participant.clone());
-            has_update = true;
-        }
+        let participant_jid = child
+            .child("participant")
+            .and_then(|p| p.attr("jid"))
+            .map(String::from)
+            .or_else(|| participant.clone());
+        let participant_info = || -> Vec<GroupParticipantInfo> {
+            child
+                .children("participant")
+                .iter()
+                .map(|p| GroupParticipantInfo {
+                    jid: p.attr("jid").unwrap_or_default().to_string(),
+                    phone_number: p.attr("phone_number").map(String::from),
+                })
+                .collect()
+        };
+        let emit_group_update = |update: GroupUpdate| {
+            let _ = self.events.send(ClientEvent::GroupsUpdate {
+                updates: vec![GroupUpdate { id: jid.clone(), author: participant.clone(), ..update }],
+            });
+        };
+        let emit_participants = |participants: Vec<GroupParticipantInfo>, action: &str| {
+            let _ = self.events.send(ClientEvent::GroupParticipantsUpdate {
+                update: GroupParticipantsUpdate {
+                    id: jid.clone(),
+                    author: participant.clone(),
+                    participants,
+                    action: action.to_string(),
+                },
+            });
+        };
+        let on_off = |tag: &str, on: &str| tag == on;
 
-        // Participantes: add/remove/promote/demote.
-        if let Some(participants_node) = node.child("add").or_else(|| node.child("remove")).or_else(|| node.child("promote")).or_else(|| node.child("demote")) {
-            let action = participants_node.tag.clone();
-            let mut jids: Vec<String> = Vec::new();
-            for child in participants_node.children("participant") {
-                if let Some(jid) = child.attr("jid") {
-                    jids.push(jid.to_string());
+        match child.tag.as_str() {
+            "create" => {
+                if let Some(metadata) = crate::groups::extract_group_metadata(child) {
+                    let mut group = serde_json::to_value(&metadata).unwrap_or_default();
+                    if let (Some(obj), Some(author)) = (group.as_object_mut(), participant.clone()) {
+                        obj.insert("author".to_string(), serde_json::Value::String(author));
+                    }
+                    let _ = self.events.send(ClientEvent::GroupsUpsert { groups: vec![group] });
                 }
             }
-            if !jids.is_empty() {
-                let _ = self.events.send(ClientEvent::GroupParticipantsUpdate {
-                    update: GroupParticipantsUpdate {
-                        id: from.clone(),
-                        author: participants_node.attr("participant").map(String::from).or(participant.clone()),
-                        participants: jids,
-                        action,
-                    },
-                });
+            "modify" => {
+                // `participantInfo` não é preenchido no `modify` do Node.
+                emit_participants(Vec::new(), "modify");
+                self.group_meta_cache.remove(&jid).await;
             }
-            return;
-        }
-
-        if has_update {
-            let _ = self.events.send(ClientEvent::GroupsUpdate {
-                updates: vec![update],
-            });
+            "promote" | "demote" | "remove" | "add" | "leave" => {
+                let participants = participant_info();
+                let action = match child.tag.as_str() {
+                    "leave" => "remove",
+                    tag => tag,
+                };
+                emit_participants(participants.clone(), action);
+                match action {
+                    "remove" => {
+                        if let Some(mut metadata) = self.group_meta_cache.get(&jid).await {
+                            for p in &participants {
+                                if let Some(index) = metadata
+                                    .participants
+                                    .iter()
+                                    .position(|m| m.lid.as_deref() == Some(p.jid.as_str()))
+                                {
+                                    metadata.participants.remove(index);
+                                }
+                            }
+                            metadata.size = metadata.participants.len();
+                            self.group_meta_cache.set(jid.clone(), metadata).await;
+                        }
+                    }
+                    "add" => {
+                        if let Some(mut metadata) = self.group_meta_cache.get(&jid).await {
+                            for p in &participants {
+                                let exists = metadata
+                                    .participants
+                                    .iter()
+                                    .any(|m| m.lid.as_deref() == Some(p.jid.as_str()) || m.id == p.jid);
+                                if !exists {
+                                    metadata.participants.push(crate::groups::GroupParticipant {
+                                        id: p.jid.clone(),
+                                        lid: Some(p.jid.clone()),
+                                        jid: p.phone_number.clone().unwrap_or_default(),
+                                        admin: None,
+                                    });
+                                }
+                            }
+                            metadata.size = metadata.participants.len();
+                            self.group_meta_cache.set(jid.clone(), metadata).await;
+                        }
+                    }
+                    _ => self.group_meta_cache.remove(&jid).await,
+                }
+            }
+            "subject" => {
+                emit_group_update(GroupUpdate {
+                    subject: child.attr("subject").map(String::from),
+                    ..Default::default()
+                });
+                self.group_meta_cache.remove(&jid).await;
+            }
+            "description" => {
+                let desc = child.child("body").map(|b| b.content_text()).filter(|d| !d.is_empty());
+                emit_group_update(GroupUpdate { desc, ..Default::default() });
+                self.group_meta_cache.remove(&jid).await;
+            }
+            "announcement" | "not_announcement" => {
+                emit_group_update(GroupUpdate {
+                    announce: Some(on_off(&child.tag, "announcement")),
+                    ..Default::default()
+                });
+                self.group_meta_cache.remove(&jid).await;
+            }
+            "locked" | "unlocked" => {
+                emit_group_update(GroupUpdate {
+                    restrict: Some(on_off(&child.tag, "locked")),
+                    ..Default::default()
+                });
+                self.group_meta_cache.remove(&jid).await;
+            }
+            "invite" => {
+                emit_group_update(GroupUpdate {
+                    invite_code: child.attr("code").map(String::from),
+                    ..Default::default()
+                });
+                self.group_meta_cache.remove(&jid).await;
+            }
+            "member_add_mode" => {
+                let mode = child.content_text();
+                if !mode.is_empty() {
+                    emit_group_update(GroupUpdate {
+                        member_add_mode: Some(mode == "all_member_add"),
+                        ..Default::default()
+                    });
+                    self.group_meta_cache.remove(&jid).await;
+                }
+            }
+            "membership_approval_mode" => {
+                if let Some(group_join) = child.child("group_join") {
+                    emit_group_update(GroupUpdate {
+                        join_approval_mode: Some(group_join.attr("state") == Some("on")),
+                        ..Default::default()
+                    });
+                    self.group_meta_cache.remove(&jid).await;
+                }
+            }
+            "created_membership_requests" | "revoked_membership_requests" => {
+                tracing::debug!(jid, participant = ?participant_jid, tag = %child.tag, "group join request");
+                self.group_meta_cache.remove(&jid).await;
+            }
+            "suspended" | "unsuspended" => {
+                emit_group_update(GroupUpdate {
+                    suspended: Some(child.tag == "suspended"),
+                    ..Default::default()
+                });
+                self.group_meta_cache.remove(&jid).await;
+            }
+            "delete" => {
+                emit_group_update(GroupUpdate {
+                    deleted: Some(true),
+                    delete_reason: child.attr("reason").map(String::from),
+                    ..Default::default()
+                });
+                self.group_meta_cache.remove(&jid).await;
+            }
+            _ => {}
         }
     }
 
-    /// Converte um nó `<group>` (ou create) em JSON espelhando o
-    /// `parseGroupData` do Node (id, subject, subjectOwner, author, etc.).
-    fn group_node_to_json(&self, node: &BinaryNode, id: &str) -> serde_json::Value {
-        let mut json = serde_json::Map::new();
-        json.insert("id".to_string(), serde_json::Value::String(id.to_string()));
-        json.insert("subject".to_string(), serde_json::Value::String(node.attr("subject").unwrap_or_default().to_string()));
-        json.insert("subjectOwner".to_string(), serde_json::Value::String(node.attr("s_o").unwrap_or_default().to_string()));
-        json.insert("subjectTime".to_string(), serde_json::Value::String(node.attr("s_t").unwrap_or_default().to_string()));
-        json.insert("size".to_string(), serde_json::Value::String(node.attr("size").unwrap_or_default().to_string()));
-        json.insert("creation".to_string(), serde_json::Value::String(node.attr("creation").unwrap_or_default().to_string()));
-        json.insert("desc".to_string(), serde_json::Value::String(node.content_text()));
-        json.insert("descId".to_string(), serde_json::Value::String(node.attr("id").unwrap_or_default().to_string()));
-        json.insert("restrict".to_string(), serde_json::Value::String(node.attr("restrict").unwrap_or_default().to_string()));
-        json.insert("announce".to_string(), serde_json::Value::String(node.attr("announce").unwrap_or_default().to_string()));
-        serde_json::Value::Object(json)
+    /// `case 'devices'` do `processNotification`: apaga sessões de devices
+    /// removidos e invalida o `devicesCache` (1:1 e `group-`).
+    async fn handle_devices_notification(&self, node: &BinaryNode, sink: &WsSink) {
+        let Some(child) = (match &node.content {
+            Some(BinaryContent::Children(children)) => children.first(),
+            _ => None,
+        }) else {
+            return;
+        };
+        let devices = child.children("device");
+        let invalidate = |normalized: String| async move {
+            self.devices_cache.remove(&normalized).await;
+            self.devices_cache.remove(&format!("group-{normalized}")).await;
+        };
+        match child.tag.as_str() {
+            "remove" => {
+                let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
+                for device in &devices {
+                    for attr in ["jid", "lid"] {
+                        let Some(value) = device.attr(attr) else { continue };
+                        if let Ok(addr) = repo.jid_to_signal_protocol_address(value) {
+                            self.store.remove_generic("session", &addr);
+                        }
+                        invalidate(baileys_core::jid_normalized_user(value)).await;
+                    }
+                }
+            }
+            "update" => {
+                let me_lid = self.store.creds().me.and_then(|m| m.lid).unwrap_or_default();
+                let normalized = baileys_core::jid_normalized_user(&me_lid);
+                let lids = if baileys_core::is_lid_user(&normalized) {
+                    None
+                } else {
+                    self.get_lid(&normalized, sink).await.ok().flatten()
+                };
+                invalidate(normalized).await;
+                if let Some(lids) = lids {
+                    invalidate(lids).await;
+                }
+            }
+            "add" => {
+                for device in &devices {
+                    for attr in ["jid", "lid"] {
+                        let Some(value) = device.attr(attr) else { continue };
+                        invalidate(baileys_core::jid_normalized_user(value)).await;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     // --- handlers de pareamento / login ---
@@ -1580,165 +1811,57 @@ impl Client {
         sink: &WsSink,
     ) -> Result<(), ClientError> {
         let from = node.attr("from").unwrap_or_default().to_string();
-        let participant = node.attr("participant").map(String::from);
 
-        // Ack primeiro (class = message).
-        self.send_message_ack(node, sink).await?;
+        // `shouldIgnoreJid` (ack e sai).
+        if self.should_ignore_jid(&from) && from != "@s.whatsapp.net" {
+            tracing::debug!(from = %from, "ignored message");
+            return self.send_message_ack(node, sink).await;
+        }
 
-        // Decodifica o envelope.
-        let Some((full_message, author, sender, key_extras)) = self.decode_message_node(node) else {
-            tracing::debug!(from = %from, "decode_message_node retornou None (mensagem ignorada)");
+        // `<unavailable type="view_once">`: upsert (`append`) + ack, sem decrypt.
+        if node.child("unavailable").and_then(|u| u.attr("type")) == Some("view_once") {
+            if let Some(decoded) = self.decode_message_node(node) {
+                let mut info = decoded.full;
+                clean_message(&mut info, &self.me_id());
+                let _ = self.events.send(ClientEvent::Message {
+                    info,
+                    raw: node.clone(),
+                    key_extras: decoded.key_extras,
+                });
+            }
+            return self.send_message_ack(node, sink).await;
+        }
+
+        // `msmsg` (Meta AI): só ack.
+        if node.child("enc").and_then(|e| e.attr("type")) == Some("msmsg") {
+            return self.send_message_ack(node, sink).await;
+        }
+
+        // `decodeMessageNode` lança em envelope inválido (o Node não faz ack).
+        let Some(decoded) = self.decode_message_node(node) else {
+            tracing::warn!(from = %from, "decodeMessageNode: envelope inválido, mensagem ignorada");
             return Ok(());
         };
-        tracing::debug!(from = %from, participant = ?participant, author = %author, sender = %sender, "mensagem decodificada");
+        let DecodedMessageNode { full: mut info, author, sender, key_extras, category } = decoded;
+        tracing::debug!(from = %from, author = %author, sender = %sender, "mensagem decodificada");
 
-        // Descriptografa cada <enc>.
-        let mut info = full_message;
-        let mut decrypted_any = false;
-        let mut decryptables = 0usize;
-        let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
-        let me_lid = self
-            .store
-            .creds()
-            .me
-            .clone()
-            .and_then(|m| m.lid)
-            .unwrap_or_else(|| me_id.clone());
-
-        if let Some(BinaryContent::Children(children)) = &node.content {
-            for child in children {
-                let content_bytes = match &child.content {
-                    Some(BinaryContent::Bytes(b)) => b.clone(),
-                    _ => continue,
-                };
-                let e2e_type = match child.tag.as_str() {
-                    "plaintext" => "plaintext".to_string(),
-                    "enc" => child.attr("type").unwrap_or("msg").to_string(),
-                    _ => {
-                        tracing::debug!(tag = %child.tag, "filho ignorado no handle_message");
-                        continue;
-                    }
-                };
-                decryptables += 1;
-                tracing::debug!(tag = %child.tag, e2e_type = %e2e_type, "descriptografando filho");
-
-                let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
-                let decrypted = match e2e_type.as_str() {
-                    "skmsg" => repo.decrypt_group_message(&sender, &author, &content_bytes),
-                    "pkmsg" | "msg" => {
-                        let user = if is_jid_user(&sender) { &sender } else { &author };
-                        repo.decrypt_message(user, &e2e_type, &content_bytes)
-                    }
-                    "plaintext" => Ok(content_bytes.clone()),
-                    _ => continue,
-                };
-
-                match decrypted {
-                    Ok(buf) => {
-                        decrypted_any = true;
-                        let unpadded = baileys_core::ids::unpad_random_max16(&buf).unwrap_or(buf);
-                        match wa::Message::decode(unpadded.as_slice()) {
-                            Ok(decoded) => {
-                                let inner = decoded.device_sent_message.as_ref().and_then(|d| d.message.clone().map(|m| *m));
-                                let msg = inner.unwrap_or(decoded);
-                                // Diagnóstico: só loga quando a mensagem decriptou VAZIA
-                                // (nenhum campo reconhecido) — é o caso que vira [unknown].
-                                let has_content = msg.conversation.is_some()
-                                    || msg.extended_text_message.is_some()
-                                    || msg.image_message.is_some()
-                                    || msg.video_message.is_some()
-                                    || msg.audio_message.is_some()
-                                    || msg.document_message.is_some()
-                                    || msg.sticker_message.is_some()
-                                    || msg.protocol_message.is_some();
-                                if !has_content {
-                                    tracing::debug!(
-                                        e2e_type = %e2e_type,
-                                        conversation = msg.conversation.is_some(),
-                                        extended_text = msg.extended_text_message.is_some(),
-                                        image = msg.image_message.is_some(),
-                                        video = msg.video_message.is_some(),
-                                        audio = msg.audio_message.is_some(),
-                                        document = msg.document_message.is_some(),
-                                        sticker = msg.sticker_message.is_some(),
-                                        protocol = msg.protocol_message.is_some(),
-                                        "Message decodificada VAZIA (vira [unknown] no manager)"
-                                    );
-                                }
-                                info.message = Some(msg.clone());
-
-                                // Sender key distribution.
-                                if let Some(skdm) = &msg.sender_key_distribution_message {
-                                    if let Some(axolotl) = &skdm.axolotl_sender_key_distribution_message {
-                                        if let Some(group_id) = &skdm.group_id {
-                                            let _ = repo.process_sender_key_distribution_message(
-                                                group_id,
-                                                &author,
-                                                axolotl,
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Reação (messages.reaction).
-                                if let Some(reaction) = &msg.reaction_message {
-                                    let key = reaction.key.clone();
-                                    let remote_jid = key
-                                        .as_ref()
-                                        .and_then(|k| k.remote_jid.clone())
-                                        .unwrap_or_else(|| from.clone());
-                                    let id = key
-                                        .as_ref()
-                                        .and_then(|k| k.id.clone())
-                                        .unwrap_or_default();
-                                    let _ = self.events.send(ClientEvent::MessagesReaction {
-                                        reactions: vec![MessageReaction {
-                                            remote_jid,
-                                            id,
-                                            from_me: key
-                                                .as_ref()
-                                                .and_then(|k| k.from_me)
-                                                .unwrap_or(false),
-                                            text: reaction.text.clone(),
-                                            sender_timestamp_ms: reaction.sender_timestamp_ms,
-                                        }],
-                                    });
-                                }
-
-                                // ProtocolMessage: revoke/edit/history-sync.
-                                if let Some(protocol) = &msg.protocol_message {
-                                    self.handle_protocol_message(&protocol, &msg, &from, &participant)
-                                        .await;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(error = %e, "falha ao decodificar Message");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, e2e_type = %e2e_type, "falha ao descriptografar");
-                        info.message_stub_type = Some(wa::web_message_info::StubType::Ciphertext as i32);
-                        info.message_stub_parameters = vec![e.to_string()];
-                    }
+        // `lidCache` a partir de `sender_lid` + `sender_pn` (só chat 1:1).
+        if is_jid_user(&from) || is_lid_user(&from) {
+            if let (Some(sender_lid), Some(sender_pn)) = (&key_extras.sender_lid, &key_extras.sender_pn) {
+                let pn = baileys_core::jid_normalized_user(sender_pn);
+                if self.lid_cache.get(&pn).await.is_none() {
+                    self.lid_cache.set(pn, baileys_core::jid_normalized_user(sender_lid)).await;
                 }
             }
         }
 
-        if !decrypted_any {
-            let msg_id = info.key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default();
+        self.decrypt_message_node(node, &mut info, &author, &sender);
 
-            // Regra do Hineken (`decode-wa-message.ts` + `messages-recv.ts`):
-            // - Sem nenhum ciphertext no nó ("Message absent from node"):
-            //   PDO placeholder resend (receipt retry faria o outro reenviar à toa).
-            // - Com ciphertext mas descriptografia falhou (bad MAC, sender key
-            //   ausente, etc.): receipt retry com keys.
-            if decryptables == 0 {
-                info.message_stub_type = Some(wa::web_message_info::StubType::Ciphertext as i32);
-                info.message_stub_parameters = vec!["Message absent from node".to_string()];
-
-                // Fanout de bot/hosted/view-once: não pede resend (port do
-                // `shouldSkipPlaceholderResend` do Hineken).
+        let msg_id = info.key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default();
+        if info.message_stub_type == Some(wa::web_message_info::StubType::Ciphertext as i32) {
+            let stub = info.message_stub_parameters.first().cloned().unwrap_or_default();
+            if stub == NO_MESSAGE_FOUND_ERROR_TEXT {
+                // Sem ciphertext no nó (fanout/ads): só PDO.
                 let unavailable_type = node
                     .child("unavailable")
                     .and_then(|u| u.attr("type").map(String::from));
@@ -1748,96 +1871,218 @@ impl Client {
                         | Some("hosted_unavailable_fanout")
                         | Some("view_once_unavailable_fanout")
                 );
+                self.send_message_ack(node, sink).await?;
                 if skip {
-                    tracing::debug!(msg_id = %msg_id, unavailable_type = ?unavailable_type, "mensagem sem ciphertext — fanout excluído, sem resend");
-                } else {
-                    // PDO placeholder resend (paridade Hineken): pede a
-                    // re-entrega ao celular (device 0). Roda em task separada
-                    // porque `request_placeholder_resend` faz `assert_sessions`
-                    // → `query_node` (aguarda resposta do servidor).
-                    tracing::info!(from = %from, msg_id = %msg_id, "mensagem sem ciphertext — pedindo PDO placeholder resend");
-                    let msg_key = info.key.clone();
-                    let client = self.clone();
-                    let sink = sink.clone();
-                    tokio::spawn(async move {
-                        if let Some(key) = msg_key {
+                    tracing::debug!(msg_id = %msg_id, unavailable_type = ?unavailable_type, "skipping placeholder resend for excluded unavailable type");
+                } else if self.sink().await.is_some() {
+                    if let Some(key) = info.key.clone() {
+                        let client = self.clone();
+                        let sink = sink.clone();
+                        let msg_id = msg_id.clone();
+                        tokio::spawn(async move {
                             if let Err(e) = client.request_placeholder_resend(key, &sink).await {
-                                tracing::warn!(error = %e, msg_id, "falha ao pedir placeholder resend");
+                                tracing::warn!(error = %e, msg_id, "failed to request placeholder resend");
                             }
-                        }
-                    });
-                    // Registra a falha no manager (para o retry manual e o
-                    // marcador de "recuperada" na re-entrega).
-                    let _ = self.events.send(ClientEvent::MessageFailed {
-                        info: info.clone(),
-                        raw: node.clone(),
-                        reason: "Message absent from node".to_string(),
-                    });
+                        });
+                    }
                 }
             } else {
-                // Ciphertext falhou — mantém o erro real nos stub_parameters
-                // (já setado no branch Err acima).
-                let reason = info.message_stub_parameters.join(", ");
-                tracing::info!(from = %from, msg_id = %msg_id, reason = %reason, "mensagem indecifrável — enviando receipt de retry automático");
-
-                // Paridade Hineken: o ack já foi enviado no início do
-                // `handle_message`; agora dispara o `<receipt type="retry">`.
-                // Roda em task separada porque `send_retry_request` agora faz
-                // `assert_sessions` → `query_node` (aguarda resposta do
-                // servidor). Inline no loop de leitura = deadlock → `query
-                // timed out` (mesmo bug do handle_success/receipt).
+                self.send_message_ack(node, sink).await?;
                 let client = self.clone();
-                let node = node.clone();
                 let sink = sink.clone();
                 let retry_node = node.clone();
+                let msg_id = msg_id.clone();
                 tokio::spawn(async move {
                     let _guard = client.retry_mutex.lock().await;
-                    if let Err(e) = client.send_retry_request(&retry_node, &sink).await {
-                        tracing::warn!(error = %e, msg_id, "falha ao enviar retry automático");
+                    if client.sink().await.is_some() {
+                        if let Err(e) = client.send_retry_request(&retry_node, &sink).await {
+                            tracing::warn!(error = %e, msg_id, "falha ao enviar retry request");
+                        }
+                        let delay = client.config.retry_request_delay_ms;
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                    } else {
+                        tracing::debug!(msg_id, "connection closed, ignoring retry req");
                     }
                 });
-
-                // Registra a falha no manager (para o retry manual e o
-                // marcador de "recuperada" na re-entrega).
-                let _ = self.events.send(ClientEvent::MessageFailed {
-                    info: info.clone(),
-                    raw: node.clone(),
-                    reason,
-                });
             }
+            // Monitor do manager (retry manual / marcador de "recuperada").
+            let mut failed = info.clone();
+            clean_message(&mut failed, &self.me_id());
+            let _ = self.events.send(ClientEvent::MessageFailed {
+                reason: failed.message_stub_parameters.join(", "),
+                info: failed,
+                raw: node.clone(),
+            });
+        } else {
+            // Receipt: `peer_msg` (category=peer), `sender` (outro device
+            // meu; em 1:1 o participant é o author), `inactive` sem presença.
+            let key = info.key.clone().unwrap_or_default();
+            let remote_jid = key.remote_jid.clone().unwrap_or_default();
+            let mut participant = key.participant.clone();
+            let receipt_type = if category.as_deref() == Some("peer") {
+                Some("peer_msg")
+            } else if key.from_me.unwrap_or(false) {
+                if is_jid_user(&remote_jid) {
+                    participant = Some(author.clone());
+                }
+                Some("sender")
+            } else if !self.send_active_receipts.load(Ordering::Relaxed) {
+                Some("inactive")
+            } else {
+                None
+            };
+            self.send_receipt(&remote_jid, participant.as_deref(), &[msg_id.clone()], receipt_type, sink)
+                .await?;
+
+            let is_history = info
+                .message
+                .as_ref()
+                .map(normalize_message_content)
+                .and_then(|m| m.protocol_message.as_ref())
+                .and_then(|p| p.history_sync_notification.as_ref())
+                .is_some();
+            if is_history {
+                let jid = baileys_core::jid_normalized_user(&remote_jid);
+                self.send_receipt(&jid, None, &[msg_id.clone()], Some("hist_sync"), sink).await?;
+            }
+
+            self.send_message_ack(node, sink).await?;
         }
 
-        // Receipt de entrega — o Hineken só envia no branch de sucesso
-        // (descriptografou). No branch CIPHERTEXT ele manda só o ack + o
-        // `<receipt type="retry">`. Enviar delivery receipt para o mesmo msg
-        // id do retry (depois dele) contradiz o retry e atrapalha a
-        // re-entrega — a ordem importa.
-        let is_ciphertext = info.message_stub_type
-            == Some(wa::web_message_info::StubType::Ciphertext as i32);
-        if !is_ciphertext && !info.key.clone().unwrap_or_default().from_me.unwrap_or(false) {
-            // Paridade Node: o receipt usa o `remoteJid` CRU (chatId antes do
-            // `cleanMessage`); só o key do webhook é normalizado.
-            let remote = sender.clone();
-            let msg_id = info.key.clone().and_then(|k| k.id).unwrap_or_default();
-            self.send_receipt(&remote, participant.as_deref(), &[msg_id], None, sink).await?;
-        }
-
+        // `cleanMessage` + `upsertMessage` (→ `processMessage`).
+        clean_message(&mut info, &self.me_id());
         let _ = self.events.send(ClientEvent::Message {
             info: info.clone(),
             raw: node.clone(),
-            key_extras,
+            key_extras: key_extras.clone(),
         });
-        tracing::debug!(from = %from, msg_id = %info.key.clone().and_then(|k| k.id).unwrap_or_default(), "evento Message emitido");
+        tracing::debug!(from = %from, msg_id = %msg_id, "evento Message emitido");
 
-        let _ = me_lid;
+        self.process_message(&info, &key_extras, sink).await;
         Ok(())
     }
 
-    /// Port de `decodeMessageNode` (parse do envelope, sem descriptografar).
-    fn decode_message_node(
+    /// `shouldIgnoreJid` do container (`ignoreGroups`).
+    fn should_ignore_jid(&self, jid: &str) -> bool {
+        if !self.config.ignore_groups || jid.is_empty() {
+            return false;
+        }
+        is_jid_group(jid) || jid.ends_with("@broadcast") || jid.contains("newsletter")
+    }
+
+    /// `decryptMessageNode().decrypt()` (Hineken `decode-wa-message.ts`).
+    fn decrypt_message_node(
         &self,
         stanza: &BinaryNode,
-    ) -> Option<(wa::WebMessageInfo, String, String, MessageKeyExtras)> {
+        info: &mut wa::WebMessageInfo,
+        author: &str,
+        sender: &str,
+    ) {
+        let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
+        let mut decryptables = 0usize;
+        if let Some(BinaryContent::Children(children)) = &stanza.content {
+            for child in children {
+                if child.tag == "verified_name" {
+                    if let Some(BinaryContent::Bytes(bytes)) = &child.content {
+                        let details = wa::VerifiedNameCertificate::decode(bytes.as_slice())
+                            .ok()
+                            .and_then(|cert| cert.details)
+                            .and_then(|d| wa::verified_name_certificate::Details::decode(d.as_slice()).ok());
+                        if let Some(details) = details {
+                            info.verified_biz_name = details.verified_name;
+                        }
+                    }
+                }
+                if child.tag != "enc" && child.tag != "plaintext" {
+                    continue;
+                }
+                let Some(BinaryContent::Bytes(content)) = &child.content else {
+                    continue;
+                };
+                decryptables += 1;
+
+                let e2e_type = if child.tag == "plaintext" {
+                    "plaintext".to_string()
+                } else {
+                    child.attr("type").unwrap_or_default().to_string()
+                };
+                let decoded: Result<wa::Message, String> = (|| {
+                    let buf = match e2e_type.as_str() {
+                        "skmsg" => repo
+                            .decrypt_group_message(sender, author, content)
+                            .map_err(|e| e.to_string())?,
+                        "pkmsg" | "msg" => {
+                            let user = if is_jid_user(sender) { sender } else { author };
+                            repo.decrypt_message(user, &e2e_type, content).map_err(|e| e.to_string())?
+                        }
+                        "plaintext" => content.clone(),
+                        other => return Err(format!("Unknown e2e type: {other}")),
+                    };
+                    let bytes = if e2e_type != "plaintext" {
+                        baileys_core::ids::unpad_random_max16(&buf).map_err(|e| e.to_string())?
+                    } else {
+                        buf
+                    };
+                    wa::Message::decode(bytes.as_slice()).map_err(|e| e.to_string())
+                })();
+
+                match decoded {
+                    Ok(decoded) => {
+                        // `deviceSentMessage`: preserva o `messageContextInfo`
+                        // externo (`{ ...outer, ...inner }`) — é onde vem o
+                        // `messageSecret` das mensagens enviadas pelo celular.
+                        let inner = decoded.device_sent_message.as_ref().and_then(|d| d.message.clone());
+                        let msg = match inner {
+                            Some(inner) => {
+                                let mut inner = *inner;
+                                if let Some(mut merged) = decoded.message_context_info.clone() {
+                                    if let Some(inner_ctx) = inner.message_context_info.take() {
+                                        let _ = merged.merge(inner_ctx.encode_to_vec().as_slice());
+                                    }
+                                    inner.message_context_info = Some(merged);
+                                }
+                                inner
+                            }
+                            None => decoded,
+                        };
+
+                        if let Some(skdm) = &msg.sender_key_distribution_message {
+                            if let (Some(axolotl), Some(group_id)) =
+                                (&skdm.axolotl_sender_key_distribution_message, &skdm.group_id)
+                            {
+                                if let Err(e) = repo.process_sender_key_distribution_message(group_id, author, axolotl) {
+                                    tracing::error!(error = %e, "failed to decrypt message");
+                                }
+                            }
+                        }
+
+                        // `Object.assign(fullMessage.message, msg)`.
+                        match info.message.as_mut() {
+                            Some(existing) => {
+                                let _ = existing.merge(msg.encode_to_vec().as_slice());
+                            }
+                            None => info.message = Some(msg),
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, e2e_type = %e2e_type, "failed to decrypt message");
+                        info.message_stub_type = Some(wa::web_message_info::StubType::Ciphertext as i32);
+                        info.message_stub_parameters = vec![err];
+                    }
+                }
+            }
+        }
+
+        if decryptables == 0 {
+            info.message_stub_type = Some(wa::web_message_info::StubType::Ciphertext as i32);
+            info.message_stub_parameters = vec![NO_MESSAGE_FOUND_ERROR_TEXT.to_string()];
+        }
+    }
+
+    /// Port de `decodeMessageNode` (parse do envelope, sem descriptografar).
+    fn decode_message_node(&self, stanza: &BinaryNode) -> Option<DecodedMessageNode> {
         let msg_id = stanza.attr("id").unwrap_or_default().to_string();
         let from = stanza.attr("from").unwrap_or_default().to_string();
         let participant = stanza.attr("participant").map(String::from);
@@ -1849,71 +2094,82 @@ impl Client {
         let peer_recipient_pn = stanza.attr("peer_recipient_pn").map(String::from);
         let peer_recipient_lid = stanza.attr("peer_recipient_lid").map(String::from);
 
-        let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
-        let me_lid = self
-            .store
-            .creds()
-            .me
-            .clone()
-            .and_then(|m| m.lid)
-            .unwrap_or_default();
+        let me = self.store.creds().me.clone();
+        let me_id = me.as_ref().map(|m| m.id.clone()).unwrap_or_default();
+        let me_lid = me.as_ref().and_then(|m| m.lid.clone()).unwrap_or_default();
+        let is_me = |jid: &str| !me_id.is_empty() && are_jids_same_user(jid, &me_id);
+        let is_me_lid = |jid: &str| !me_lid.is_empty() && are_jids_same_user(jid, &me_lid);
 
-        let from_me = {
-            let candidate = participant.clone().unwrap_or_else(|| from.clone());
-            are_jids_same_user(&candidate, &me_id) || (!me_lid.is_empty() && are_jids_same_user(&candidate, &me_lid))
-        };
-
-        let (chat_id, author): (String, String) = if is_jid_user(&from) || is_lid_user(&from) {
-            let chat = if let Some(r) = recipient {
-                r
-            } else {
-                from.clone()
-            };
-            let author = if from_me {
-                let user = jid_user(&me_lid).unwrap_or_default();
-                match jid_device(&from) {
-                    Some(d) if d > 0 => format!("{user}:{d}@lid"),
-                    _ => format!("{user}@lid"),
-                }
-            } else if let Some(sl) = &sender_lid {
-                sl.clone()
-            } else {
-                from.clone()
-            };
-            (chat, author)
-        } else if is_jid_group(&from) {
-            let author = if from_me {
-                let user = jid_user(&me_lid).unwrap_or_default();
-                let dev = participant.as_deref().and_then(jid_device);
-                match dev {
-                    Some(d) if d > 0 => format!("{user}:{d}@lid"),
-                    _ => format!("{user}@lid"),
-                }
-            } else if let Some(pl) = &participant_lid {
-                pl.clone()
-            } else {
-                participant.clone().unwrap_or_default()
-            };
-            (from.clone(), author)
+        // `(isLidUser(from) || isLidUser(participant) ? isMeLid : isMe)(participant || from)`.
+        let from_or_participant = participant.clone().unwrap_or_else(|| from.clone());
+        let from_me = if is_lid_user(&from) || participant.as_deref().is_some_and(is_lid_user) {
+            is_me_lid(&from_or_participant)
         } else {
-            let author = participant_lid.clone().unwrap_or_else(|| participant.clone().unwrap_or_default());
-            (from.clone(), author)
+            is_me(&from_or_participant)
         };
 
-        // Paridade `cleanMessage` (Hineken): o `key` é normalizado
-        // (`jidNormalizedUser` em remoteJid e participant). `author`/`sender`
-        // internos continuam com LID/device para a descriptografia.
-        let normalized_remote = baileys_core::jid_normalized_user(&chat_id);
-        let normalized_participant = participant
-            .as_deref()
-            .map(baileys_core::jid_normalized_user)
-            .filter(|s| !s.is_empty());
+        // `${lidUser}:${device}@lid` (sem `:0` quando o device é 0/ausente).
+        let lid_author = |lid_source: &str, device_source: &str| -> String {
+            let user = jid_user(&baileys_core::jid_normalized_user(lid_source)).unwrap_or_default();
+            match jid_device(device_source) {
+                Some(d) if d != 0 => format!("{user}:{d}@lid"),
+                _ => format!("{user}@lid"),
+            }
+        };
 
+        let (is_chat, chat_id, author) = if is_jid_user(&from) || is_lid_user(&from) {
+            let chat_id = match &recipient {
+                Some(r) if !r.ends_with("@bot") => {
+                    if !is_me(&from) && !is_me_lid(&from) {
+                        tracing::warn!(from = %from, "recipient present, but msg not from me");
+                        return None;
+                    }
+                    r.clone()
+                }
+                _ if from.is_empty() => sender_lid.clone().unwrap_or_default(),
+                _ => from.clone(),
+            };
+            let author = if from_me {
+                lid_author(&me_lid, &from)
+            } else if let Some(sl) = &sender_lid {
+                lid_author(sl, &from)
+            } else {
+                from.clone()
+            };
+            (true, chat_id, author)
+        } else if is_jid_group(&from) {
+            let Some(p) = participant.clone() else {
+                tracing::warn!(from = %from, "No participant in group message");
+                return None;
+            };
+            let author = if from_me {
+                lid_author(&me_lid, &p)
+            } else if let Some(pl) = &participant_lid {
+                lid_author(pl, &p)
+            } else {
+                p.clone()
+            };
+            (false, from.clone(), author)
+        } else if from.ends_with("@broadcast") {
+            if participant.is_none() && participant_lid.is_some() {
+                tracing::warn!(from = %from, "No participant in group message");
+                return None;
+            }
+            let author = participant_lid.clone().or_else(|| participant.clone()).unwrap_or_default();
+            (false, from.clone(), author)
+        } else if from.ends_with("@newsletter") {
+            (false, from.clone(), from.clone())
+        } else {
+            tracing::warn!(from = %from, "Unknown message type");
+            return None;
+        };
+
+        // Key crua (o `cleanMessage` normaliza depois do receipt).
         let key = wa::MessageKey {
-            remote_jid: Some(normalized_remote),
+            remote_jid: Some(chat_id.clone()),
             from_me: Some(from_me),
-            id: Some(msg_id.clone()),
-            participant: normalized_participant,
+            id: Some(msg_id),
+            participant: participant.clone(),
         };
 
         let full = wa::WebMessageInfo {
@@ -1926,6 +2182,7 @@ impl Client {
                 None
             },
             push_name: stanza.attr("notify").map(String::from),
+            broadcast: Some(from.ends_with("@broadcast")),
             ..Default::default()
         };
 
@@ -1938,104 +2195,279 @@ impl Client {
             peer_recipient_lid,
         };
 
-        let sender = chat_id.clone();
-        Some((full, author, sender, key_extras))
+        Some(DecodedMessageNode {
+            full,
+            sender: if is_chat { author.clone() } else { chat_id },
+            author,
+            key_extras,
+            category: stanza.attr("category").map(String::from),
+        })
     }
 
-    /// Port de `processSyncAction`/`messaging-history.set` + `messages.update`
-    /// a partir de um `ProtocolMessage` (revoke, message edit, history sync).
-    async fn handle_protocol_message(
-        &self,
-        protocol: &wa::message::ProtocolMessage,
-        _msg: &wa::Message,
-        from: &str,
-        participant: &Option<String>,
+    /// `processMessage` (Hineken `process-message.ts`) sobre a mensagem já
+    /// limpa: protocolo, `secretEncryptedMessage` e reação.
+    async fn process_message(
+        self: &Arc<Self>,
+        info: &wa::WebMessageInfo,
+        key_extras: &MessageKeyExtras,
+        _sink: &WsSink,
     ) {
-        let r#type = protocol.r#type.unwrap_or(-1);
-        let key = protocol.key.as_ref().cloned();
+        let (Some(message), Some(key)) = (info.message.as_ref(), info.key.as_ref()) else {
+            return;
+        };
+        let content = normalize_message_content(message);
+        if let Some(protocol) = content.protocol_message.as_deref() {
+            self.handle_protocol_message(protocol, info, key, key_extras).await;
+        } else if let Some(secret) = content.secret_encrypted_message.as_ref() {
+            self.handle_secret_encrypted_message(secret, content, info, key, key_extras).await;
+        } else if let Some(reaction) = content.reaction_message.as_ref() {
+            // `messages.reaction` com a key da mensagem reagida (já normalizada).
+            let reacted = reaction.key.clone().unwrap_or_default();
+            let _ = self.events.send(ClientEvent::MessagesReaction {
+                reactions: vec![MessageReaction {
+                    remote_jid: reacted.remote_jid.unwrap_or_default(),
+                    id: reacted.id.unwrap_or_default(),
+                    from_me: reacted.from_me.unwrap_or(false),
+                    text: reaction.text.clone(),
+                    sender_timestamp_ms: reaction.sender_timestamp_ms,
+                }],
+            });
+        }
+    }
 
-        // Revoke / MessageEdit → messages.update.
-        if r#type == wa::message::protocol_message::Type::Revoke as i32
-            || r#type == wa::message::protocol_message::Type::MessageEdit as i32
-        {
-            let is_revoke = r#type == wa::message::protocol_message::Type::Revoke as i32;
-            let update = MessageStatusUpdate {
-                key: MessageUpdateKey {
-                    remote_jid: key
-                        .as_ref()
-                        .and_then(|k| k.remote_jid.clone())
-                        .unwrap_or_else(|| from.to_string()),
-                    id: key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default(),
-                    from_me: key.as_ref().and_then(|k| k.from_me).unwrap_or(false),
-                    participant: key
-                        .as_ref()
-                        .and_then(|k| k.participant.clone())
-                        .or_else(|| participant.clone()),
-                },
-                update: MessageUpdateData {
-                    message_stub_type: if is_revoke {
-                        Some(wa::web_message_info::StubType::Revoke as i32)
-                    } else {
-                        None
+    /// `case protocolMsg.type` do `processMessage`.
+    async fn handle_protocol_message(
+        self: &Arc<Self>,
+        protocol: &wa::message::ProtocolMessage,
+        info: &wa::WebMessageInfo,
+        key: &wa::MessageKey,
+        key_extras: &MessageKeyExtras,
+    ) {
+        use wa::message::protocol_message::Type;
+        let r#type = protocol.r#type.unwrap_or(-1);
+        let target_id = protocol.key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default();
+
+        if r#type == Type::HistorySyncNotification as i32 {
+            // Download HTTP fora do loop de leitura.
+            if let Some(notification) = protocol.history_sync_notification.clone() {
+                let client = self.clone();
+                tokio::spawn(async move {
+                    client.process_history_sync_notification(&notification).await;
+                });
+            }
+        } else if r#type == Type::Revoke as i32 {
+            let envelope = MessageUpdateKey::from_envelope(key, key_extras, key.id.clone().unwrap_or_default());
+            let _ = self.events.send(ClientEvent::MessagesUpdate {
+                updates: vec![MessageStatusUpdate {
+                    key: MessageUpdateKey::from_envelope(key, key_extras, target_id),
+                    update: MessageUpdateData {
+                        message: Some(serde_json::Value::Null),
+                        message_stub_type: Some(wa::web_message_info::StubType::Revoke as i32),
+                        key: Some(envelope),
+                        ..Default::default()
                     },
-                    message: if is_revoke { Some(serde_json::Value::Null) } else { None },
+                }],
+            });
+        } else if r#type == Type::PeerDataOperationRequestResponseMessage as i32 {
+            let Some(response) = protocol.peer_data_operation_request_response_message.as_ref() else {
+                return;
+            };
+            if let Some(stanza_id) = &response.stanza_id {
+                self.placeholder_resend_cache.remove(stanza_id).await;
+            }
+            for result in &response.peer_data_operation_result {
+                let Some(bytes) = result
+                    .placeholder_message_resend_response
+                    .as_ref()
+                    .and_then(|r| r.web_message_info_bytes.clone())
+                else {
+                    continue;
+                };
+                let Ok(web_message_info) = wa::WebMessageInfo::decode(bytes.as_slice()) else {
+                    continue;
+                };
+                // `setTimeout(() => ev.emit('messages.upsert', ...), 500)`.
+                let client = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = client.events.send(ClientEvent::Message {
+                        info: web_message_info,
+                        raw: BinaryNode::new("message"),
+                        key_extras: MessageKeyExtras::default(),
+                    });
+                });
+            }
+        } else if r#type == Type::MessageEdit as i32 {
+            self.emit_message_edit(
+                key,
+                key_extras,
+                target_id,
+                protocol.edited_message.as_deref(),
+                protocol.timestamp_ms,
+                info.message_timestamp,
+            );
+        }
+    }
+
+    /// `messages.update` de edição: `{ key: {...message.key, id}, update:
+    /// { message: { editedMessage: { message } }, messageTimestamp } }`.
+    fn emit_message_edit(
+        &self,
+        key: &wa::MessageKey,
+        key_extras: &MessageKeyExtras,
+        target_id: String,
+        edited: Option<&wa::Message>,
+        timestamp_ms: Option<i64>,
+        fallback_timestamp: Option<u64>,
+    ) {
+        let edited_message = match edited {
+            Some(m) => serde_json::json!({ "message": baileys_proto::proto_to_json_value(m) }),
+            None => serde_json::json!({}),
+        };
+        let message_timestamp = timestamp_ms
+            .filter(|ms| *ms != 0)
+            .map(|ms| (ms / 1000) as u64)
+            .or(fallback_timestamp);
+        let _ = self.events.send(ClientEvent::MessagesUpdate {
+            updates: vec![MessageStatusUpdate {
+                key: MessageUpdateKey::from_envelope(key, key_extras, target_id),
+                update: MessageUpdateData {
+                    message: Some(serde_json::json!({ "editedMessage": edited_message })),
+                    message_timestamp,
                     ..Default::default()
                 },
-            };
-            let _ = self.events.send(ClientEvent::MessagesUpdate {
-                updates: vec![update],
-            });
+            }],
+        });
+    }
+
+    /// `secretEncryptedMessage` (`MESSAGE_EDIT`): decifra com o
+    /// `messageSecret` da própria edição ou, na falta, da mensagem original.
+    async fn handle_secret_encrypted_message(
+        &self,
+        secret: &wa::message::SecretEncryptedMessage,
+        content: &wa::Message,
+        info: &wa::WebMessageInfo,
+        key: &wa::MessageKey,
+        key_extras: &MessageKeyExtras,
+    ) {
+        use wa::message::secret_encrypted_message::SecretEncType;
+        if secret.secret_enc_type != Some(SecretEncType::MessageEdit as i32) {
             return;
         }
+        let Some(target_key) = secret.target_message_key.as_ref() else {
+            return;
+        };
+        let Some(target_id) = target_key.id.clone().filter(|id| !id.is_empty()) else {
+            return;
+        };
 
-        // History sync notification → parse do payload (inline ou download).
-        if r#type == wa::message::protocol_message::Type::HistorySyncNotification as i32 {
-            if let Some(notification) = &protocol.history_sync_notification {
-                let sync_type = notification.sync_type.unwrap_or(0);
-                let progress = notification.progress.unwrap_or(0);
-                let is_latest = progress >= 100;
+        let chat_jid = if key.from_me.unwrap_or(false) {
+            let me_lid = self.store.creds().me.and_then(|m| m.lid).unwrap_or_default();
+            baileys_core::jid_normalized_user(&me_lid)
+        } else {
+            let source = key_extras
+                .sender_lid
+                .clone()
+                .or_else(|| key_extras.participant_lid.clone())
+                .or_else(|| key.remote_jid.clone())
+                .unwrap_or_default();
+            baileys_core::jid_normalized_user(&source)
+        };
 
-                // Inline bootstrap payload (initialHistBootstrapInlinePayload)
-                // ou download via directPath (mediaKey + fileEncSha256).
-                let mut history: Option<wa::HistorySync> = None;
-                if let Some(inline) = &notification.initial_hist_bootstrap_inline_payload {
-                    if let Ok(decoded) = wa::HistorySync::decode(inline.as_slice()) {
-                        history = Some(decoded);
-                    }
-                } else if let Some(decoded) = self.download_history_sync(notification).await {
-                    history = Some(decoded);
-                }
-
-                if let Some(h) = history {
-                    // `messages` extraído direto (sem reter `Conversation`
-                    // completo: o consumidor só usa `data.messages`).
-                    let messages: Vec<wa::WebMessageInfo> = h
-                        .conversations
-                        .into_iter()
-                        .flat_map(|c| c.messages)
-                        .filter_map(|m| m.message)
-                        .collect();
-                    let contacts: Vec<serde_json::Value> = h
-                        .pushnames
-                        .iter()
-                        .map(|p| {
-                            serde_json::json!({
-                                "id": p.id,
-                                "pushName": p.pushname,
-                            })
-                        })
-                        .collect();
-                    let _ = self.events.send(ClientEvent::MessagingHistorySet {
-                        data: MessagingHistorySet {
-                            contacts,
-                            messages,
-                            is_latest,
-                            progress,
-                            sync_type,
-                        },
-                    });
+        let mut message_secret = content
+            .message_context_info
+            .as_ref()
+            .and_then(|c| c.message_secret.clone())
+            .filter(|s| !s.is_empty());
+        if message_secret.is_none() {
+            // `getMessage(targetKey)`.
+            let load = self.load_message_fn.lock().await.clone();
+            if let Some(load) = load {
+                let remote = target_key.remote_jid.clone().unwrap_or_default();
+                if let Some(bytes) = load(target_id.clone(), remote).await {
+                    message_secret = wa::Message::decode(bytes.as_slice())
+                        .ok()
+                        .and_then(|m| m.message_context_info)
+                        .and_then(|c| c.message_secret)
+                        .filter(|s| !s.is_empty());
                 }
             }
+            tracing::debug!(
+                target_id,
+                has_fallback_secret = message_secret.is_some(),
+                "secretEncryptedMessage: messageSecret missing on edit, tried original message fallback"
+            );
+        }
+        let Some(message_secret) = message_secret else {
+            return;
+        };
+
+        match decrypt_secret_encrypted_edit(secret, &message_secret, &target_id, &chat_jid) {
+            Ok(decrypted) => {
+                if let Some(edit) = decrypted.protocol_message.as_deref() {
+                    if edit.edited_message.is_some() {
+                        self.emit_message_edit(
+                            key,
+                            key_extras,
+                            target_id,
+                            edit.edited_message.as_deref(),
+                            edit.timestamp_ms,
+                            info.message_timestamp,
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, target_id, "failed to decrypt secretEncryptedMessage edit");
+            }
+        }
+    }
+
+    /// `HISTORY_SYNC_NOTIFICATION` → `messaging-history.set`.
+    async fn process_history_sync_notification(&self, notification: &wa::message::HistorySyncNotification) {
+        let sync_type = notification.sync_type.unwrap_or(0);
+        let progress = notification.progress.unwrap_or(0);
+        let is_latest = progress >= 100;
+
+        // Inline bootstrap payload (initialHistBootstrapInlinePayload)
+        // ou download via directPath (mediaKey + fileEncSha256).
+        let mut history: Option<wa::HistorySync> = None;
+        if let Some(inline) = &notification.initial_hist_bootstrap_inline_payload {
+            if let Ok(decoded) = wa::HistorySync::decode(inline.as_slice()) {
+                history = Some(decoded);
+            }
+        } else if let Some(decoded) = self.download_history_sync(notification).await {
+            history = Some(decoded);
+        }
+
+        if let Some(h) = history {
+            // `messages` extraído direto (sem reter `Conversation`
+            // completo: o consumidor só usa `data.messages`).
+            let messages: Vec<wa::WebMessageInfo> = h
+                .conversations
+                .into_iter()
+                .flat_map(|c| c.messages)
+                .filter_map(|m| m.message)
+                .collect();
+            let contacts: Vec<serde_json::Value> = h
+                .pushnames
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "pushName": p.pushname,
+                    })
+                })
+                .collect();
+            let _ = self.events.send(ClientEvent::MessagingHistorySet {
+                data: MessagingHistorySet {
+                    contacts,
+                    messages,
+                    is_latest,
+                    progress,
+                    sync_type,
+                },
+            });
         }
     }
 
@@ -2111,14 +2543,13 @@ impl Client {
         if let Some(recipient) = node.attr("recipient") {
             ack = ack.with_attr("recipient", recipient);
         }
-        // Espelha `sendMessageAck` do Node: `type` só entra quando o nó tem
-        // `type` E (não é `message` OU é `unavailable`). Para `unavailable`,
-        // o `from` do ack vira o próprio `me.id`.
+        // Hineken: `!!attrs.type && (tag !== 'message' || unavailable ||
+        // errorCode !== 0)` — sem `errorCode` (undefined) a condição é sempre
+        // verdadeira, então o `type` entra sempre. Para `unavailable`, o
+        // `from` do ack vira o próprio `me.id`.
         let has_unavailable = node.child("unavailable").is_some();
         if let Some(r#type) = node.attr("type") {
-            if node.tag != "message" || has_unavailable {
-                ack = ack.with_attr("type", r#type);
-            }
+            ack = ack.with_attr("type", r#type);
         }
         if node.tag == "message" && has_unavailable {
             let me_id = self.store.creds().me.clone().map(|m| m.id).unwrap_or_default();
@@ -2140,13 +2571,22 @@ impl Client {
             return Ok(());
         }
         let mut node = BinaryNode::new("receipt").with_attr("id", &message_ids[0]);
+        if matches!(r#type, Some("read") | Some("read-self")) {
+            node = node.with_attr("t", chrono_now_secs().to_string());
+        }
+        if r#type == Some("sender") && is_jid_user(jid) {
+            node = node
+                .with_attr("recipient", jid)
+                .with_attr("to", participant.unwrap_or_default());
+        } else {
+            node = node.with_attr("to", jid);
+            if let Some(p) = participant {
+                node = node.with_attr("participant", p);
+            }
+        }
         if let Some(t) = r#type {
             node = node.with_attr("type", t);
         }
-        if let Some(p) = participant {
-            node = node.with_attr("participant", p);
-        }
-        node = node.with_attr("to", jid);
 
         if message_ids.len() > 1 {
             let list = BinaryNode::new("list").with_children(
@@ -2179,73 +2619,31 @@ impl Client {
             return Ok(());
         }
 
-        // Decodifica o envelope para obter o msgKey (remoteJid).
-        let remote_jid = self
-            .decode_message_node(node)
-            .map(|(full, _, _, _)| full.key.and_then(|k| k.remote_jid).unwrap_or_default())
-            .unwrap_or_default();
+        // `decodeMessageNode(node).fullMessage.key` (key crua).
+        let Some(msg_key) = self.decode_message_node(node).and_then(|d| d.full.key) else {
+            return Ok(());
+        };
+        let remote_jid = msg_key.remote_jid.clone().unwrap_or_default();
         let cache_key = format!("{msg_id}:{remote_jid}");
-        const MAX_MSG_RETRY_COUNT: u32 = 5;
 
-        // Incrementa o contador de retries (thread-safe).
         let mut retry_count = self.msg_retry_cache.get(&cache_key).await.unwrap_or(0);
-        if retry_count >= MAX_MSG_RETRY_COUNT {
-            tracing::debug!(retry_count, msg_id, "retry atingiu o limite, ignorando");
+        if retry_count >= self.config.max_msg_retry_count {
+            tracing::debug!(retry_count, msg_id, "reached retry limit, clearing");
             return Ok(());
         }
         retry_count += 1;
         self.msg_retry_cache.set(cache_key.clone(), retry_count).await;
 
-        // Segunda tentativa (e além): o receipt com keys já foi; pede a mesma
-        // mensagem ao celular via PDO e para.
+        // Segunda tentativa: o receipt com keys já foi. Pede a mesma mensagem
+        // ao celular e para.
         if retry_count > 1 {
-            tracing::info!(msg_id, retry_count, "pedindo reenvio ao celular (PDO) após retry com keys");
-            let msg_key = self
-                .decode_message_node(node)
-                .and_then(|(full, _, _, _)| full.key);
-            if let Some(key) = msg_key {
-                // Task separada: o PDO faz `assert_sessions` → `query_node`
-                // (aguarda resposta do servidor). Inline no loop de leitura =
-                // deadlock → `query timed out` (mesmo bug do retry/success).
-                let client = self.clone();
-                let sink = sink.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = client.request_placeholder_resend(key, &sink).await {
-                        tracing::warn!(error = %e, msg_id, "falha ao pedir placeholder resend");
-                    }
-                });
+            tracing::info!(msg_id, retry_count, "requesting phone resend after key retry");
+            if self.sink().await.is_some() {
+                if let Err(e) = self.request_placeholder_resend(msg_key, sink).await {
+                    tracing::warn!(error = %e, msg_id, "failed to request placeholder resend");
+                }
             }
             return Ok(());
-        }
-
-        // Paridade Hineken (1ª tentativa): garante a sessão 1:1 com o
-        // participante ANTES do receipt. A distribuição da sender key volta
-        // como `pkmsg` 1:1; sem sessão, nem a distribuição descriptografa e a
-        // `skmsg` continua falhando. `force` só na primeira vez por
-        // dispositivo (force_session_cache) para não floodar `<iq encrypt>`.
-        let retry_jid = node
-            .attr("participant")
-            .or_else(|| node.attr("from"))
-            .unwrap_or_default()
-            .to_string();
-        let lid = if baileys_core::is_lid_user(&retry_jid) {
-            Some(retry_jid.clone())
-        } else {
-            self.get_lid(&retry_jid, sink).await?
-        };
-        let force = {
-            if self.force_session_cache.contains(&retry_jid).await {
-                false
-            } else {
-                self.force_session_cache.set(retry_jid.clone(), ()).await;
-                true
-            }
-        };
-        if let Err(e) = self
-            .assert_sessions(&[retry_jid.clone()], force, lid.as_deref(), sink)
-            .await
-        {
-            tracing::warn!(jid = %retry_jid, error = %e, "assert_sessions no retry falhou (não fatal)");
         }
 
         let creds = self.store.creds();
@@ -2610,6 +3008,12 @@ impl Client {
             "receipt recebido"
         );
 
+        // `shouldIgnoreJid(remoteJid)` sem `<retry>`: só ack.
+        if self.should_ignore_jid(&from) && node.child("retry").is_none() {
+            tracing::debug!(from, "ignoring receipt from jid");
+            return self.send_message_ack(node, sink).await;
+        }
+
         // `message-receipt.update` / `messages.update` — port exato do
         // `handleReceipt` do Hineken (messages-recv.ts). Só emite para
         // `type != "retry"` (retry é processado abaixo).
@@ -2671,6 +3075,7 @@ impl Client {
                                     id: id.clone(),
                                     from_me,
                                     participant: Some(participant_jid.clone()),
+                                    ..Default::default()
                                 },
                                 receipt: UserReceipt {
                                     user_jid: user_jid.clone(),
@@ -2691,6 +3096,7 @@ impl Client {
                                 id: id.clone(),
                                 from_me,
                                 participant: participant.clone(),
+                                ..Default::default()
                             },
                             update: MessageUpdateData {
                                 status,
@@ -2701,6 +3107,10 @@ impl Client {
                     let _ = self.events.send(ClientEvent::MessagesUpdate { updates });
                 }
             }
+        }
+
+        if receipt_type == "retry" {
+            let _ = self.events.send(ClientEvent::RetryReceipt { node: node.clone() });
         }
 
         if receipt_type != "retry" {
@@ -2785,49 +3195,55 @@ impl Client {
             }
         });
 
-        let (cached_jid, mut cached_bytes) = {
-            let cache = self.send_cache.lock().await;
-            cache
-                .get(&msg_id)
-                .cloned()
-                .unwrap_or_else(|| (remote.clone(), Vec::new()))
-        };
-        let target_jid = if cached_jid.is_empty() { remote.clone() } else { cached_jid.clone() };
-
-        // Se não está no cache em memória (ex: restart do processo), tenta
-        // recuperar do store do app — port do `getMessage` do Hineken.
-        if cached_bytes.is_empty() {
-            let load = self.load_message_fn.lock().await.clone();
-            if let Some(load) = load {
-                match load(msg_id.clone(), target_jid.clone()).await {
-                    Some(bytes) if !bytes.is_empty() => {
-                        self.cache_send(msg_id.clone(), target_jid.clone(), bytes.clone()).await;
-                        cached_bytes = bytes;
-                        tracing::debug!(msg_id, target_jid, "mensagem recuperada do store para retry");
-                    }
-                    _ => {}
-                }
-            }
+        // `key.participant = key.participant || attrs.from` +
+        // `willSendMessageAgain(ids[0], key.participant)`.
+        let will_key = format!("{msg_id}:{}", participant.clone().unwrap_or_else(|| from.clone()));
+        if self.msg_retry_cache.get(&will_key).await.unwrap_or(0) >= self.config.max_msg_retry_count {
+            tracing::info!(msg_id, "will not send message again, as sent too many times");
+            return Ok(());
         }
-
-        if cached_bytes.is_empty() {
-            tracing::warn!(msg_id, target_jid, "retry solicitado mas mensagem não está no cache/store");
+        // `key.fromMe` do `handleReceipt` (`!attrs.recipient || isNodeFromMe` em retry).
+        if !(recipient.is_none() || is_node_from_me) {
+            tracing::info!(msg_id, "recv retry for not fromMe message");
             return Ok(());
         }
 
-        // Resolve o LID do destinatário para o endereçamento da sessão (Node
-        // passa `lids` para `assertSessions` e `convertlidDevice`).
-        let lid = if baileys_core::is_jid_group(&target_jid) {
-            None
-        } else {
-            match self.get_lid(&target_jid, sink).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(error = %e, msg_id, target_jid, "retry: falha ao resolver LID");
-                    return Ok(());
-                }
-            }
-        };
+        // `catch` do Node: `msgRetryCache.flushAll()`.
+        let result = self
+            .resend_retry(node, sink, &msg_id, &remote, retry_participant)
+            .await;
+        if let Err(e) = &result {
+            tracing::error!(msg_id, error = %e, "error in sending message again");
+            self.msg_retry_cache.clear().await;
+        }
+        result
+    }
+
+    /// Corpo do `try` do retry no `handleReceipt` (Hineken `messages-recv.ts` 885–951).
+    async fn resend_retry(
+        &self,
+        node: &BinaryNode,
+        sink: &WsSink,
+        msg_id: &str,
+        remote: &str,
+        retry_participant: Option<String>,
+    ) -> Result<(), ClientError> {
+        let from = node.attr("from").unwrap_or_default().to_string();
+        let msg_id = msg_id.to_string();
+        let remote = remote.to_string();
+
+        let cache_key = format!("{msg_id}:{remote}");
+        let mut retry_count = self.msg_retry_cache.get(&cache_key).await.unwrap_or(0);
+        if retry_count >= self.config.max_msg_retry_count {
+            tracing::debug!(retry_count, cache_key, "reached retry limit, clearing");
+            return Ok(());
+        }
+        retry_count += 1;
+        self.msg_retry_cache.set(cache_key, retry_count).await;
+
+        if baileys_core::is_jid_group(&remote) {
+            self.sender_key_memory.remove(&remote).await;
+        }
 
         // Tenta extrair e injetar a sessão E2E do bundle `<keys>` do retry
         // (port de `extractE2ESessionFromRetryReceipt`).
@@ -2876,7 +3292,8 @@ impl Client {
             );
             if let (Some(identity), Some((sk_id, sk_pub)), Some(sk_sig), Some((pk_id, pk_pub)), Some(registration)) = bundle {
                 let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
-                let dest = convert_lid_device(retry_participant_jid, lid.as_deref(), &me_id, &me_lid);
+                // Node: `injectE2ESession({ jid: retryParticipantJid })` — JID cru.
+                let dest = retry_participant_jid.to_string();
                 match repo.inject_e2e_session(
                     &dest,
                     InjectSession {
@@ -2921,20 +3338,32 @@ impl Client {
                         true
                     }
                 };
-                self.assert_sessions(&[retry_participant_jid.to_string()], force, lid.as_deref(), sink).await?;
+                let lids = self.node_get_lid(retry_participant_jid, sink).await?;
+                self.assert_sessions(&[retry_participant_jid.to_string()], force, lids.as_deref(), sink).await?;
             }
         }
 
-        // Node `messages-recv.ts:898`: antes do reenvio em grupo, apaga a
-        // `sender-key-memory` do grupo para forçar nova distribuição da
-        // sender key (senão o peer reusa uma chave antiga e não decripta).
-        if baileys_core::is_jid_group(&target_jid) {
-            self.sender_key_memory.remove(&target_jid).await;
+        // `getMessage(key)` (o `sendMessageCache` está comentado no Node). Sem
+        // hook de store, cai no cache em memória do envio.
+        let load = self.load_message_fn.lock().await.clone();
+        let cached_bytes = match load {
+            Some(load) => load(msg_id.clone(), remote.clone()).await.unwrap_or_default(),
+            None => self
+                .send_cache
+                .lock()
+                .await
+                .get(&msg_id)
+                .map(|(_, bytes)| bytes.clone())
+                .unwrap_or_default(),
+        };
+        if cached_bytes.is_empty() {
+            tracing::debug!(msg_id, remote, "Message not found, in retry");
+            return Ok(());
         }
+        let target_jid = remote.clone();
 
-        // Node `messages-recv.ts:940-946`: recupera a mensagem, apaga o
-        // `messageContextInfo` (segredo de reporting) e delega para o
-        // `relayMessage` com `{ messageId, isretry: true, participant }`.
+        // `delete msg.messageContextInfo` e `relayMessage(key.remoteJid, msg,
+        // { messageId, isretry: true, participant? })`.
         let mut msg = wa::Message::decode(cached_bytes.as_slice()).unwrap_or_default();
         msg.message_context_info = None;
 
@@ -3253,50 +3682,8 @@ impl Client {
         }
         tracing::debug!(?me_jids, ?other_jids, "fanout 1:1 separado");
 
-        // Se nenhum device foi retornado (USync vazio/offline), cai no envio
-        // direto para o JID normalizado — mantém o comportamento anterior.
-        if all_jids.is_empty() {
-            let normalized = baileys_core::jid_normalized_user(jid);
-            other_jids.push(normalized.clone());
-            all_jids.push(normalized);
-        }
-
-        // Garante sessões com todos os alvos.
+        // Node: `assertSessions(allJids, force=false, lids)` (force só com participant).
         self.assert_sessions(&all_jids, false, lid.as_deref(), sink).await?;
-
-        // Device 0 do remetente (phone): força o refresh da sessão E2E uma
-        // única vez por conexão. Quando a sessão local dessincroniza, o phone
-        // fica "aguardando mensagem" e nem sempre emite retry; buscar o bundle
-        // fresco via `<iq encrypt>` recupera na hora (port do `forceSession`
-        // usado no retry do Hineken).
-        {
-            let own_device0: Vec<String> = me_jids
-                .iter()
-                .filter(|j| {
-                    let u = jid_user(j).unwrap_or_default();
-                    let d = jid_device(j).unwrap_or(0);
-                    (u == my_user || u == my_lid_user) && d == 0
-                })
-                .cloned()
-                .collect();
-            for dev0 in own_device0 {
-                let already = {
-                    if self.force_session_cache.contains(&dev0).await {
-                        true
-                    } else {
-                        self.force_session_cache.set(dev0.clone(), ()).await;
-                        false
-                    }
-                };
-                if already {
-                    continue;
-                }
-                match self.assert_sessions(&[dev0.clone()], true, lid.as_deref(), sink).await {
-                    Ok(()) => tracing::debug!(jid = %dev0, "sessão do device 0 do remetente atualizada"),
-                    Err(e) => tracing::warn!(jid = %dev0, error = %e, "refresh forçado da sessão do device 0 falhou (não fatal)"),
-                }
-            }
-        }
 
         let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
 
@@ -3313,6 +3700,9 @@ impl Client {
         let mut participants: Vec<BinaryNode> = Vec::new();
         let mut should_include_device_identity = false;
 
+        // `createParticipantNodes` aplica `patchMessageBeforeSending` em cada lote.
+        let me_msg = self.patch_message(&me_msg);
+        let other_msg = self.patch_message(&message);
         let lid_ref = lid.clone();
         for sender_id in &me_jids {
             let dest = convert_lid_device(sender_id, lid_ref.as_deref(), &me_id, &me_lid);
@@ -3325,7 +3715,7 @@ impl Client {
         }
         for sender_id in &other_jids {
             let dest = convert_lid_device(sender_id, lid_ref.as_deref(), &me_id, &me_lid);
-            let enc = repo.encrypt_message(&dest, &write_random_pad_max16(&message.encode_to_vec()))?;
+            let enc = repo.encrypt_message(&dest, &write_random_pad_max16(&other_msg.encode_to_vec()))?;
             if enc.r#type == "pkmsg" {
                 should_include_device_identity = true;
             }
@@ -3340,7 +3730,7 @@ impl Client {
             lid.as_deref(),
             &destination_jid,
             true,
-            Some((&message, msg_id, None)),
+            Some((&other_msg, msg_id, None)),
         ));
 
         let mut stanza = BinaryNode::new("message")
@@ -3918,15 +4308,18 @@ impl Client {
         // `isGroup && participant` (Node linhas 540–590): retry de grupo — a
         // mensagem volta como `senderKeyDistributionMessage` cifrada 1:1 para
         // SOMENTE o participante pedinte (não reenvia para todos).
+        // `patchMessageBeforeSending(message)` — é o que vai no `skmsg` e no reporting.
+        let patched = self.patch_message(&message);
+
         if let Some(participant) = participant {
             // Node: encryptGroupMessage({ group: destinationJid, data: bytes, meId: meLid }).
             let enc = repo.encrypt_group_message(
                 jid,
                 &me_lid,
-                &write_random_pad_max16(&message.encode_to_vec()),
+                &write_random_pad_max16(&patched.encode_to_vec()),
             )?;
             let message_to_send = {
-                let mut patched = message.clone();
+                let mut patched = patched.clone();
                 patched.sender_key_distribution_message =
                     Some(wa::message::SenderKeyDistributionMessage {
                         axolotl_sender_key_distribution_message: Some(
@@ -3986,7 +4379,7 @@ impl Client {
         let enc = repo.encrypt_group_message(
             jid,
             &me_lid,
-            &write_random_pad_max16(&message.encode_to_vec()),
+            &write_random_pad_max16(&patched.encode_to_vec()),
         )?;
 
         tracing::info!(
@@ -4142,7 +4535,7 @@ impl Client {
         if !sender_key_jids.is_empty() {
             self.assert_sessions(&sender_key_jids, false, None, sink).await?;
 
-            let sk_msg_bytes = sender_key_msg.encode_to_vec();
+            let sk_msg_bytes = self.patch_message(&sender_key_msg).encode_to_vec();
             for sender_id in &sender_key_jids {
                 let dest = convert_lid_device(sender_id, None, &me_id, &me_lid);
                 let sk_enc = repo
@@ -4173,7 +4566,7 @@ impl Client {
             None,
             jid,
             false,
-            Some((&message, msg_id, None)),
+            Some((&patched, msg_id, None)),
         ));
 
         let mut stanza = BinaryNode::new("message")
@@ -4885,6 +5278,11 @@ impl Client {
         let me_id = me.id;
         let me_lid = me.lid.unwrap_or_default();
 
+        if matches!(presence_type, "available" | "unavailable") {
+            // `ev.emit('connection.update', { isOnline })` → `sendActiveReceipts`.
+            self.send_active_receipts
+                .store(presence_type == "available", Ordering::Relaxed);
+        }
         let node = match presence_type {
             "available" | "unavailable" => BinaryNode::new("presence")
                 .with_attr("name", me_id.replace('@', ""))
@@ -4901,20 +5299,67 @@ impl Client {
         self.send_node(&node, sink).await
     }
 
-    /// `readMessages` — envia receipts de leitura (read/read-self).
+    /// `fetchPrivacySettings` — `<iq xmlns=privacy type=get><privacy/>`,
+    /// reduzido a `{ name: value }` e cacheado (como o Node).
+    pub async fn fetch_privacy_settings(
+        &self,
+        force: bool,
+        sink: &WsSink,
+    ) -> Result<HashMap<String, String>, ClientError> {
+        if !force {
+            if let Some(cached) = self.privacy_settings.lock().await.clone() {
+                return Ok(cached);
+            }
+        }
+        let query = BinaryNode::new("iq")
+            .with_attr("xmlns", "privacy")
+            .with_attr("to", S_WHATSAPP_NET)
+            .with_attr("type", "get")
+            .with_attr("id", self.next_tag())
+            .with_children(vec![BinaryNode::new("privacy")]);
+        let result = self.query_node(query, sink).await?;
+        let mut settings = HashMap::new();
+        if let Some(privacy) = result.child("privacy") {
+            for category in privacy.children("category") {
+                let name = category.attr("name").or_else(|| category.attr("config_code"));
+                let value = category.attr("value").or_else(|| category.attr("config_value"));
+                if let (Some(name), Some(value)) = (name, value) {
+                    settings.insert(name.to_string(), value.to_string());
+                }
+            }
+        }
+        *self.privacy_settings.lock().await = Some(settings.clone());
+        Ok(settings)
+    }
+
+    /// `readMessages` — `read` (readreceipts=all) ou `read-self`, agrupado
+    /// por chat + participante (`aggregateMessageKeysNotFromMe`).
     pub async fn read_messages(
         &self,
         keys: &[wa::MessageKey],
         sink: &WsSink,
     ) -> Result<(), ClientError> {
-        if keys.is_empty() {
-            return Ok(());
+        let settings = self.fetch_privacy_settings(false, sink).await?;
+        let read_type = if settings.get("readreceipts").map(String::as_str) == Some("all") {
+            "read"
+        } else {
+            "read-self"
+        };
+
+        let mut groups: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+        for key in keys.iter().filter(|k| !k.from_me.unwrap_or(false)) {
+            let jid = key.remote_jid.clone().unwrap_or_default();
+            let participant = key.participant.clone().filter(|p| !p.is_empty());
+            let Some(id) = key.id.clone() else { continue };
+            match groups.iter_mut().find(|(j, p, _)| *j == jid && *p == participant) {
+                Some((_, _, ids)) => ids.push(id),
+                None => groups.push((jid, participant, vec![id])),
+            }
         }
-        let remote = keys[0].remote_jid.clone().unwrap_or_default();
-        let participant = keys[0].participant.clone();
-        let ids: Vec<String> = keys.iter().filter_map(|k| k.id.clone()).collect();
-        self.send_receipt(&remote, participant.as_deref(), &ids, Some("read"), sink)
-            .await
+        for (jid, participant, ids) in groups {
+            self.send_receipt(&jid, participant.as_deref(), &ids, Some(read_type), sink).await?;
+        }
+        Ok(())
     }
 
     /// `updateProfilePicture` — troca a foto de perfil (própria ou de grupo).
@@ -5056,6 +5501,119 @@ fn is_lid_user(jid: &str) -> bool {
     baileys_core::is_lid_user(jid)
 }
 
+/// Primeiro wrapper `FutureProofMessage` presente (`getFutureProofMessage`).
+macro_rules! first_future_proof {
+    (@fields $m:expr, $conv:ident, [$($field:ident),*]) => {{
+        $( if $m.$field.is_some() { return $m.$field.$conv(); } )*
+        None
+    }};
+    ($m:expr, $conv:ident) => {{
+        first_future_proof!(@fields $m, $conv, [
+            ephemeral_message, view_once_message, document_with_caption_message,
+            view_once_message_v2, view_once_message_v2_extension, edited_message,
+            status_add_yours, bot_task_message, event_cover_image, question_message,
+            bot_invoke_message, lottie_sticker_message, group_status_message,
+            limit_sharing_message, status_mention_message, poll_creation_message_v4,
+            poll_creation_message_v5, associated_child_message, group_mentioned_message,
+            group_status_mention_message, poll_creation_option_image_message
+        ])
+    }};
+}
+
+fn future_proof_ref(m: &wa::Message) -> Option<&wa::message::FutureProofMessage> {
+    first_future_proof!(m, as_deref)
+}
+
+fn future_proof_mut(m: &mut wa::Message) -> Option<&mut wa::message::FutureProofMessage> {
+    first_future_proof!(m, as_deref_mut)
+}
+
+/// `normalizeMessageContent` (até 5 níveis de wrapper).
+fn normalize_message_content(message: &wa::Message) -> &wa::Message {
+    let mut content = message;
+    for _ in 0..5 {
+        match future_proof_ref(content).and_then(|f| f.message.as_deref()) {
+            Some(inner) => content = inner,
+            None => break,
+        }
+    }
+    content
+}
+
+fn normalize_message_content_mut(message: &mut wa::Message, depth: u8) -> &mut wa::Message {
+    if depth >= 5 || future_proof_ref(message).and_then(|f| f.message.as_ref()).is_none() {
+        return message;
+    }
+    let inner = future_proof_mut(message)
+        .and_then(|f| f.message.as_deref_mut())
+        .expect("wrapper verificado acima");
+    normalize_message_content_mut(inner, depth + 1)
+}
+
+/// `cleanMessage` do Hineken: normaliza `remoteJid`/`participant` e traz as
+/// keys de reação/voto para a perspectiva deste usuário.
+fn clean_message(info: &mut wa::WebMessageInfo, me_id: &str) {
+    let Some(key) = info.key.as_mut() else {
+        return;
+    };
+    key.remote_jid = Some(baileys_core::jid_normalized_user(key.remote_jid.as_deref().unwrap_or_default()));
+    key.participant = key.participant.as_deref().map(baileys_core::jid_normalized_user);
+    let from_me = key.from_me.unwrap_or(false);
+    let remote_jid = key.remote_jid.clone();
+    let participant = key.participant.clone();
+
+    let Some(message) = info.message.as_mut() else {
+        return;
+    };
+    let content = normalize_message_content_mut(message, 0);
+    let normalise_key = |msg_key: &mut wa::MessageKey| {
+        if from_me {
+            return;
+        }
+        msg_key.from_me = Some(if !msg_key.from_me.unwrap_or(false) {
+            let who = msg_key
+                .participant
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .or(msg_key.remote_jid.as_deref())
+                .unwrap_or_default();
+            are_jids_same_user(who, me_id)
+        } else {
+            false
+        });
+        msg_key.remote_jid = remote_jid.clone();
+        if msg_key.participant.as_deref().map_or(true, str::is_empty) {
+            msg_key.participant = participant.clone();
+        }
+    };
+    if let Some(k) = content.reaction_message.as_mut().and_then(|r| r.key.as_mut()) {
+        normalise_key(k);
+    }
+    if let Some(k) = content
+        .poll_update_message
+        .as_mut()
+        .and_then(|p| p.poll_creation_message_key.as_mut())
+    {
+        normalise_key(k);
+    }
+}
+
+/// `decryptSecretEncryptedEdit`: HKDF-SHA256 (salt vazio, info = id + chatJid
+/// + chatJid + "Message Edit") e AES-256-GCM sem AAD.
+fn decrypt_secret_encrypted_edit(
+    secret: &wa::message::SecretEncryptedMessage,
+    message_secret: &[u8],
+    original_msg_id: &str,
+    chat_jid: &str,
+) -> Result<wa::Message, String> {
+    let enc_payload = secret.enc_payload.as_deref().ok_or("secretEncryptedMessage sem encPayload")?;
+    let enc_iv = secret.enc_iv.as_deref().ok_or("secretEncryptedMessage sem encIv")?;
+    let info = format!("{original_msg_id}{chat_jid}{chat_jid}Message Edit");
+    let key = baileys_crypto::hkdf(message_secret, 32, None, &info).map_err(|e| e.to_string())?;
+    let plaintext = baileys_crypto::aes_decrypt_gcm(enc_payload, &key, enc_iv, &[]).map_err(|e| e.to_string())?;
+    wa::Message::decode(plaintext.as_slice()).map_err(|e| e.to_string())
+}
+
 fn is_jid_group(jid: &str) -> bool {
     baileys_core::is_jid_group(jid)
 }
@@ -5136,6 +5694,14 @@ fn pretty_devices(devices: &[(String, u32, String)]) -> String {
         })
         .collect();
     serde_json::to_string_pretty(&arr).unwrap_or_default()
+}
+
+/// `unixTimestampSeconds()`.
+fn chrono_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `isTcTokenExpired` (port de `Utils/tc-token-utils.ts`) — bucket rolante

@@ -174,6 +174,31 @@ impl<'a> Decoder<'a> {
         Ok(jid_encode(&user, server, Some(device as u32)))
     }
 
+    /// `readFbJid`: `${user}:${device}@${server}`.
+    fn read_fb_jid(&mut self) -> Result<String, DecodeError> {
+        let user = self.read_string_from_next_tag()?;
+        let device = self.read_int(2)?;
+        let server = self.read_string_from_next_tag()?;
+        Ok(format!("{user}:{device}@{server}"))
+    }
+
+    /// `readInteropJid`: `${integrator}-${user}:${device}@${server}`, com
+    /// `server = 'interop'` quando a leitura falha (índice restaurado).
+    fn read_interop_jid(&mut self) -> Result<String, DecodeError> {
+        let user = self.read_string_from_next_tag()?;
+        let device = self.read_int(2)?;
+        let integrator = self.read_int(2)?;
+        let before_server = self.index;
+        let server = match self.read_string_from_next_tag() {
+            Ok(s) => s,
+            Err(_) => {
+                self.index = before_server;
+                "interop".to_string()
+            }
+        };
+        Ok(format!("{integrator}-{user}:{device}@{server}"))
+    }
+
     fn read_string(&mut self, tag: u8) -> Result<String, DecodeError> {
         if tag >= 1 && (tag as usize) < SINGLE_BYTE_TOKENS.len() {
             return Ok(SINGLE_BYTE_TOKENS[tag as usize].to_string());
@@ -204,6 +229,8 @@ impl<'a> Decoder<'a> {
                 self.read_string_from_chars(len)
             }
             tags::JID_PAIR => self.read_jid_pair(),
+            tags::FB_JID => self.read_fb_jid(),
+            tags::INTEROP_JID => self.read_interop_jid(),
             tags::AD_JID => self.read_ad_jid(),
             tags::HEX_8 | tags::NIBBLE_8 => self.read_packed8(tag),
             _ => Err(DecodeError::InvalidStringTag(tag)),

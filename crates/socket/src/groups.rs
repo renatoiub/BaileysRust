@@ -41,6 +41,11 @@ pub struct GroupMetadata {
     pub ephemeral_duration: Option<u64>,
     pub participants: Vec<GroupParticipant>,
     pub addressing_mode: Option<String>,
+    #[serde(rename = "owner_country_code")]
+    pub owner_country_code: Option<String>,
+    pub linked_parent: Option<String>,
+    #[serde(default)]
+    pub suspended: bool,
 }
 
 /// Participante de grupo.
@@ -97,6 +102,9 @@ pub fn extract_group_metadata(result: &BinaryNode) -> Option<GroupMetadata> {
     meta.owner = group.attr("creator").map(|c| baileys_core::jid_normalized_user(c));
     meta.owner_jid = group.attr("creator_pn").map(|c| baileys_core::jid_normalized_user(c));
 
+    meta.owner_country_code = group.attr("creator_country_code").map(String::from);
+    meta.linked_parent = group.child("linked_parent").and_then(|p| p.attr("jid")).map(String::from);
+    meta.suspended = group.child("suspended").is_some();
     meta.restrict = group.child("locked").is_some();
     meta.announce = group.child("announcement").is_some();
     meta.is_community = group.child("parent").is_some();

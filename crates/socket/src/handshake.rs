@@ -407,6 +407,12 @@ pub struct ClientConfig {
     pub keep_alive_interval_ms: u64,
     pub default_query_timeout_ms: u64,
     pub qr_timeout_ms: u64,
+    /// `maxMsgRetryCount` — vale para o pedido de retry e para o reenvio.
+    pub max_msg_retry_count: u32,
+    /// `retryRequestDelayMs` — espera após cada `sendRetryRequest`.
+    pub retry_request_delay_ms: u64,
+    /// `ignoreGroups` do container (`shouldIgnoreJid`: grupo/broadcast/newsletter).
+    pub ignore_groups: bool,
 }
 
 impl Default for ClientConfig {
@@ -419,6 +425,9 @@ impl Default for ClientConfig {
             keep_alive_interval_ms: 10_000,
             default_query_timeout_ms: 40_000,
             qr_timeout_ms: 60_000,
+            max_msg_retry_count: 5,
+            retry_request_delay_ms: 250,
+            ignore_groups: false,
         }
     }
 }

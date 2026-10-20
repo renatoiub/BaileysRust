@@ -14,7 +14,7 @@
 //! usam `cache:global:{namespace}`; caches por conexão usam
 //! `cache:instance:{instanceKey}:{namespace}` (definido pelo app).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,8 @@ pub struct TtlCache<T> {
     /// Prefixo das chaves repassadas ao backend (ex.: `cache:global:devices`).
     namespace: std::sync::Mutex<String>,
     backend: std::sync::Mutex<Option<Arc<dyn CacheStore>>>,
+    /// Chaves gravadas por este cache (para o `clear`/`flushAll` no backend).
+    known_keys: std::sync::Mutex<HashSet<String>>,
 }
 
 impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
@@ -74,6 +76,7 @@ impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
             max_keys,
             namespace: std::sync::Mutex::new(String::new()),
             backend: std::sync::Mutex::new(None),
+            known_keys: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -123,6 +126,7 @@ impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
     }
 
     pub async fn set_with_ttl(&self, key: String, value: T, ttl: Duration) {
+        self.known_keys.lock().unwrap().insert(key.clone());
         // Tenta o backend primeiro (JSON + TTL em segundos).
         let backend = self.backend.lock().unwrap().clone();
         let backend_key = self.backend_key(&key);
@@ -170,5 +174,18 @@ impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
             let _ = backend.remove(&backend_key).await;
         }
         self.inner.lock().await.remove(key);
+        self.known_keys.lock().unwrap().remove(key);
+    }
+
+    /// `flushAll` do node-cache: remove todas as chaves gravadas por este cache.
+    pub async fn clear(&self) {
+        let keys: Vec<String> = self.known_keys.lock().unwrap().drain().collect();
+        let backend = self.backend.lock().unwrap().clone();
+        if let Some(backend) = backend {
+            for key in &keys {
+                let _ = backend.remove(&self.backend_key(key)).await;
+            }
+        }
+        self.inner.lock().await.clear();
     }
 }
