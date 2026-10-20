@@ -398,7 +398,7 @@ pub fn account_from_json(value: &serde_json::Value) -> Option<wa::AdvSignedDevic
 }
 
 /// Configuração de conexão (espelha os campos do `SocketConfig` usados no login).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientConfig {
     pub browser_os: String,
     pub browser_platform: String,
@@ -413,6 +413,30 @@ pub struct ClientConfig {
     pub retry_request_delay_ms: u64,
     /// `ignoreGroups` do container (`shouldIgnoreJid`: grupo/broadcast/newsletter).
     pub ignore_groups: bool,
+    /// `cacheControl`: liga os caches compartilháveis (metadados de grupo,
+    /// LID, onWhatsApp, foto de perfil e devices).
+    pub cache_control: bool,
+    /// Provider externo dos caches (ex.: Redis). `None` = só memória.
+    /// Os compartilháveis usam `cache:global:*`, iguais para todas as conexões.
+    pub cache_provider: Option<std::sync::Arc<dyn crate::cache::CacheStore>>,
+    /// Prefixo dos caches por conexão no provider (`cache:instance:{key}:*`).
+    pub cache_instance_key: Option<String>,
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("browser_os", &self.browser_os)
+            .field("browser_platform", &self.browser_platform)
+            .field("sync_full_history", &self.sync_full_history)
+            .field("country_code", &self.country_code)
+            .field("max_msg_retry_count", &self.max_msg_retry_count)
+            .field("ignore_groups", &self.ignore_groups)
+            .field("cache_control", &self.cache_control)
+            .field("cache_provider", &self.cache_provider.is_some())
+            .field("cache_instance_key", &self.cache_instance_key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ClientConfig {
@@ -428,6 +452,9 @@ impl Default for ClientConfig {
             max_msg_retry_count: 5,
             retry_request_delay_ms: 250,
             ignore_groups: false,
+            cache_control: true,
+            cache_provider: None,
+            cache_instance_key: None,
         }
     }
 }

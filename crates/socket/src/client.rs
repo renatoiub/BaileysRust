@@ -401,7 +401,7 @@ pub struct MediaUpload {
 
 type PendingQuery = tokio::sync::oneshot::Sender<BinaryNode>;
 
-use crate::cache::{CacheStore, TtlCache};
+use crate::cache::TtlCache;
 
 /// Sink de escrita do WebSocket (compartilhado entre `run` e as operações).
 pub type WsSink = Arc<
@@ -504,7 +504,7 @@ impl Client {
         let store = Arc::new(SqliteSignalStore::new(sqlite.clone())?);
         let (events, _) = tokio::sync::broadcast::channel(64);
 
-        Ok(Self {
+        let client = Self {
             store,
             config,
             epoch: AtomicU32::new(1),
@@ -519,7 +519,7 @@ impl Client {
             send_cache_order: Mutex::new(Vec::new()),
             force_session_cache: TtlCache::new(Duration::from_secs(600), 2000),
             retry_mutex: Mutex::new(()),
-            msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000),
+            msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000).with_flush_tracking(),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             devices_cache: TtlCache::new(Duration::from_secs(1000), 2000),
@@ -534,7 +534,44 @@ impl Client {
             privacy_settings: Mutex::new(None),
             pending_app_state_sync: std::sync::atomic::AtomicBool::new(false),
             app_state_mutex: Mutex::new(()),
-        })
+        };
+        client.apply_cache_config();
+        Ok(client)
+    }
+
+    /// Aplica `cache_control`/`cache_provider` do `ClientConfig`.
+    ///
+    /// - Compartilháveis (`cache:global:*`, mesmos dados para qualquer
+    ///   conexão): metadados de grupo, LID, onWhatsApp, foto e devices.
+    ///   Seguem o `cache_control`.
+    /// - Por conexão (`cache:instance:{key}:*`): sender-key-memory, retry e
+    ///   placeholder — estado do protocolo, sempre ligados.
+    /// - `forceSession` fica só em memória (`NodeCache` do Node), como antes.
+    fn apply_cache_config(&self) {
+        let enabled = self.config.cache_control;
+        self.lid_cache.set_enabled(enabled);
+        self.devices_cache.set_enabled(enabled);
+        self.on_whatsapp_cache.set_enabled(enabled);
+        self.profile_picture_cache.set_enabled(enabled);
+        self.group_meta_cache.set_enabled(enabled);
+
+        let Some(provider) = self.config.cache_provider.clone() else {
+            return;
+        };
+        self.lid_cache.set_backend("cache:global:lid", Some(provider.clone()));
+        self.devices_cache.set_backend("cache:global:devices", Some(provider.clone()));
+        self.on_whatsapp_cache.set_backend("cache:global:onwhatsapp", Some(provider.clone()));
+        self.profile_picture_cache.set_backend("cache:global:profilepic", Some(provider.clone()));
+        self.group_meta_cache.set_backend("cache:global:groupmeta", Some(provider.clone()));
+
+        if let Some(instance_key) = self.config.cache_instance_key.as_deref().filter(|k| !k.is_empty()) {
+            self.sender_key_memory
+                .set_backend(&format!("cache:instance:{instance_key}:senderkey"), Some(provider.clone()));
+            self.msg_retry_cache
+                .set_backend(&format!("cache:instance:{instance_key}:msgretry"), Some(provider.clone()));
+            self.placeholder_resend_cache
+                .set_backend(&format!("cache:instance:{instance_key}:placeholder"), Some(provider));
+        }
     }
 
     /// Último código de desconexão (0 = nunca desconectou).
@@ -604,33 +641,6 @@ impl Client {
         self.store.set_extension(ext);
     }
 
-    /// Registra o backend externo de cache (ex. Redis) para todos os caches.
-    ///
-    /// - Globais/compartilhados: `cache:global:{namespace}`.
-    /// - Por conexão: `cache:instance:{instanceKey}:{namespace}` (isolados por
-    ///   instância para não misturar conexões do mesmo container nem de
-    ///   containers diferentes).
-    ///
-    /// O `TtlCache` faz fallback automático para memória quando o backend
-    /// falha, então a operação não é interrompida.
-    pub fn set_cache_backend(&self, instance_key: &str, backend: Arc<dyn CacheStore>) {
-        self.lid_cache.set_backend("cache:global:lid", Some(backend.clone()));
-        self.devices_cache.set_backend("cache:global:devices", Some(backend.clone()));
-        self.on_whatsapp_cache.set_backend("cache:global:onwhatsapp", Some(backend.clone()));
-        self.profile_picture_cache.set_backend("cache:global:profilepic", Some(backend.clone()));
-        self.group_meta_cache.set_backend("cache:global:groupmeta", Some(backend.clone()));
-        self.sender_key_memory
-            .set_backend(&format!("cache:instance:{instance_key}:senderkey"), Some(backend.clone()));
-        self.msg_retry_cache
-            .set_backend(&format!("cache:instance:{instance_key}:msgretry"), Some(backend.clone()));
-        self.placeholder_resend_cache
-            .set_backend(&format!("cache:instance:{instance_key}:placeholder"), Some(backend.clone()));
-        // `forceSession` do Node é `NodeCache({ stdTTL: 600 })` SÓ em memória
-        // (cache-utils.ts) — nunca vai pro Redis. Offload aqui faria o force
-        // valer por 24h/até expirar no Redis e o retry subsequente nunca
-        // refaria o `<iq encrypt>` (mensagem presa em "aguardando").
-    }
-
     /// Insere no `send_cache` com limite FIFO (`SEND_CACHE_MAX`). Remove a
     /// entrada mais antiga quando o limite é atingido — o retry cai no store
     /// Redis do app (`load_message_fn`), então a evicção é segura.
@@ -695,7 +705,7 @@ impl Client {
             "wss://web.whatsapp.com/ws/chat{}",
             self.routing_query().await
         );
-        tracing::info!(url, "conectando ao WhatsApp");
+        tracing::debug!(url, "conectando ao WhatsApp");
 
         let (ws_stream, _) = connect_async(&url).await.map_err(ClientError::WebSocket)?;
         let (sink, stream) = ws_stream.split();
@@ -793,7 +803,7 @@ impl Client {
                         .map_err(ClientError::WebSocket)?;
                     n.finish_init().await?;
                     handshake_done = true;
-                    tracing::info!("handshake Noise completo");
+                    tracing::debug!("handshake Noise completo");
                 }
             }
 
@@ -973,7 +983,7 @@ impl Client {
                 BinaryNode::new("offline_batch").with_attr("count", "100"),
             ]);
             self.send_node(&batch, sink).await?;
-            tracing::info!("offline_preview recebido; pedi lote offline (count=100)");
+            tracing::debug!("offline_preview recebido; pedi lote offline (count=100)");
             return Ok(());
         }
 
@@ -985,7 +995,7 @@ impl Client {
                 .child("offline")
                 .and_then(|c| c.attr("count"))
                 .unwrap_or("0");
-            tracing::info!(count, "offline: servidor entregou notificações pendentes");
+            tracing::debug!(count, "offline: servidor entregou notificações pendentes");
             return Ok(());
         }
 
@@ -997,7 +1007,7 @@ impl Client {
                 .child("dirty")
                 .and_then(|c| c.attr("type"))
                 .unwrap_or("unknown");
-            tracing::info!(r#type = dtype, "dirty: sincronização pendente recebida");
+            tracing::debug!(r#type = dtype, "dirty: sincronização pendente recebida");
             return Ok(());
         }
 
@@ -1525,7 +1535,7 @@ impl Client {
         let ref_nodes: Vec<&BinaryNode> = pair_device.map(|p| p.children("ref")).unwrap_or_default();
 
         if ref_nodes.is_empty() {
-            tracing::info!("pair-device passkey request — uso manual");
+            tracing::debug!("pair-device passkey request — uso manual");
             return Ok(());
         }
 
@@ -1554,7 +1564,7 @@ impl Client {
 
         // Emite o primeiro QR já (refs[0]) e agenda a rotação dos demais.
         let qr = gen_qr(&refs[0], &noise_key_b64, &identity_key_b64, &adv_b64);
-        tracing::info!("QR disponível");
+        tracing::debug!("QR disponível");
         let _ = self.events.send(ClientEvent::Qr(qr.clone()));
         let _ = self.events.send(ClientEvent::ConnectionUpdate(ConnectionUpdate {
             connection: "connecting".to_string(),
@@ -1578,7 +1588,7 @@ impl Client {
             for r in refs_rest {
                 tokio::time::sleep(std::time::Duration::from_millis(qr_interval)).await;
                 let qr = gen_qr(&r, &noise_key_b64_rot, &identity_key_b64_rot, &adv_b64_rot);
-                tracing::info!("QR rotacionado");
+                tracing::debug!("QR rotacionado");
                 let _ = events_rot.send(ClientEvent::Qr(qr.clone()));
                 let _ = events_rot.send(ClientEvent::ConnectionUpdate(ConnectionUpdate {
                     connection: "connecting".to_string(),
@@ -1627,7 +1637,7 @@ impl Client {
         node: &BinaryNode,
         sink: &WsSink,
     ) -> Result<(), ClientError> {
-        tracing::info!(lid = ?node.attr("lid"), "handle_success: iniciando login pós-success");
+        tracing::debug!(lid = ?node.attr("lid"), "handle_success: iniciando login pós-success");
         // Login completo: para a rotação do QR (clearTimeout(qrTimer) do Node).
         self.cancel_qr_rotation().await;
 
@@ -1659,7 +1669,7 @@ impl Client {
             connection: "open".to_string(),
             ..Default::default()
         }));
-        tracing::info!("conexão aberta com o WhatsApp");
+        tracing::debug!("conexão aberta com o WhatsApp");
         Ok(())
     }
 
@@ -1686,9 +1696,9 @@ impl Client {
         &self,
         sink: &WsSink,
     ) -> Result<(), ClientError> {
-        tracing::info!("upload_pre_keys_if_required: consultando pre-keys no servidor");
+        tracing::debug!("upload_pre_keys_if_required: consultando pre-keys no servidor");
         let count = self.get_available_pre_keys_on_server(sink).await?;
-        tracing::info!("{count} pre-keys no servidor");
+        tracing::debug!("{count} pre-keys no servidor");
         if count <= MIN_PREKEY_COUNT as i64 {
             self.upload_pre_keys(INITIAL_PREKEY_COUNT, sink).await?;
         }
@@ -1699,14 +1709,14 @@ impl Client {
         &self,
         sink: &WsSink,
     ) -> Result<i64, ClientError> {
-        tracing::info!("get_available_pre_keys_on_server: montando query count");
+        tracing::debug!("get_available_pre_keys_on_server: montando query count");
         let query = BinaryNode::new("iq")
             .with_attr("id", self.next_tag())
             .with_attr("xmlns", "encrypt")
             .with_attr("type", "get")
             .with_attr("to", S_WHATSAPP_NET)
             .with_children(vec![BinaryNode::new("count")]);
-        tracing::info!("get_available_pre_keys_on_server: enviando query_node");
+        tracing::debug!("get_available_pre_keys_on_server: enviando query_node");
         let result = self.query_node(query, sink).await?;
         let count = result
             .child("count")
@@ -1721,7 +1731,7 @@ impl Client {
         count: u32,
         sink: &WsSink,
     ) -> Result<(), ClientError> {
-        tracing::info!(count, "fazendo upload de pre-keys");
+        tracing::debug!(count, "fazendo upload de pre-keys");
 
         let mut creds = self.store.creds();
         let available = creds.next_pre_key_id.saturating_sub(creds.first_unuploaded_pre_key_id);
@@ -1810,7 +1820,7 @@ impl Client {
         creds.first_unuploaded_pre_key_id = (last_pre_key_id + 1).max(creds.first_unuploaded_pre_key_id as i64) as u32;
         self.store.update_creds(creds.clone())?;
         let _ = self.events.send(ClientEvent::CredsUpdate(creds));
-        tracing::info!(count, "pre-keys enviadas");
+        tracing::debug!(count, "pre-keys enviadas");
         Ok(())
     }
 
@@ -2045,7 +2055,7 @@ impl Client {
         if self.store.creds().account_sync_counter != 0 {
             return;
         }
-        tracing::info!("doing initial app state sync");
+        tracing::debug!("doing initial app state sync");
         match self.resync_app_state(&crate::app_state::ALL_WA_PATCH_NAMES, true, sink).await {
             Ok(()) => {
                 let mut creds = self.store.creds();
@@ -2107,7 +2117,7 @@ impl Client {
                     }
                     None => app_state::LtHashState::new(),
                 };
-                tracing::info!("resyncing {name} from v{}", state.version);
+                tracing::debug!("resyncing {name} from v{}", state.version);
                 nodes.push(
                     BinaryNode::new("collection")
                         .with_attr("name", name.as_str())
@@ -2147,7 +2157,7 @@ impl Client {
                             initial_version_map.get(&name).copied(),
                             app_state::VALIDATE_SNAPSHOT_MACS,
                         )?;
-                        tracing::info!("restored state of {name} from snapshot to v{} with mutations", new_state.version);
+                        tracing::debug!("restored state of {name} from snapshot to v{} with mutations", new_state.version);
                         self.save_app_state_version(&name, &new_state);
                         states.insert(name.clone(), new_state);
                         global_mutation_map.extend(mutation_map);
@@ -2171,7 +2181,7 @@ impl Client {
                             app_state::VALIDATE_PATCH_SNAPSHOT_MACS,
                         )?;
                         self.save_app_state_version(&name, &new_state);
-                        tracing::info!("synced {name} to v{}", new_state.version);
+                        tracing::debug!("synced {name} to v{}", new_state.version);
                         initial_version_map.insert(name.clone(), new_state.version);
                         states.insert(name.clone(), new_state);
                         global_mutation_map.extend(mutation_map);
@@ -2183,7 +2193,7 @@ impl Client {
                 match outcome {
                     Ok(()) => {
                         if has_more_patches {
-                            tracing::info!("{name} has more patches...");
+                            tracing::debug!("{name} has more patches...");
                         } else {
                             collections_to_handle.retain(|c| c != &name);
                         }
@@ -2191,7 +2201,7 @@ impl Client {
                     Err(error) => {
                         let attempts = attempts_map.get(&name).copied().unwrap_or(0);
                         let irrecoverable = attempts >= app_state::MAX_SYNC_ATTEMPTS || error.is_key_not_found();
-                        tracing::info!(
+                        tracing::debug!(
                             name,
                             error = %error,
                             "failed to sync state from version{}",
@@ -2292,7 +2302,7 @@ impl Client {
             if self.store.update_creds(creds.clone()).is_ok() {
                 let _ = self.events.send(ClientEvent::CredsUpdate(creds));
             }
-            tracing::info!("archive setting updated => '{unarchive_chats}'");
+            tracing::debug!("archive setting updated => '{unarchive_chats}'");
         } else if action.star_action.is_some() || r#type == "star" {
             let starred = action
                 .star_action
@@ -2691,7 +2701,7 @@ impl Client {
                 .map(|s| s.keys.as_slice())
                 .unwrap_or_default();
             if keys.is_empty() {
-                tracing::info!("recv app state sync with 0 keys");
+                tracing::debug!("recv app state sync with 0 keys");
                 return;
             }
             let mut new_key_id = String::new();
@@ -2710,7 +2720,7 @@ impl Client {
                 new_keys.push(str_key_id.clone());
                 new_key_id = str_key_id;
             }
-            tracing::info!(new_app_state_sync_key_id = %new_key_id, ?new_keys, "injecting new app state sync keys");
+            tracing::debug!(new_app_state_sync_key_id = %new_key_id, ?new_keys, "injecting new app state sync keys");
             if !new_key_id.is_empty() {
                 let mut creds = self.store.creds();
                 creds.my_app_state_key_id = Some(new_key_id);
@@ -3094,7 +3104,7 @@ impl Client {
         // Segunda tentativa: o receipt com keys já foi. Pede a mesma mensagem
         // ao celular e para.
         if retry_count > 1 {
-            tracing::info!(msg_id, retry_count, "requesting phone resend after key retry");
+            tracing::debug!(msg_id, retry_count, "requesting phone resend after key retry");
             if self.sink().await.is_some() {
                 if let Err(e) = self.request_placeholder_resend(msg_key, sink).await {
                     tracing::warn!(error = %e, msg_id, "failed to request placeholder resend");
@@ -3161,7 +3171,7 @@ impl Client {
         ]);
 
         self.send_node(&receipt, sink).await?;
-        tracing::info!(msg_id, retry_count, "receipt de retry com keys enviado");
+        tracing::debug!(msg_id, retry_count, "receipt de retry com keys enviado");
         Ok(())
     }
 
@@ -3300,7 +3310,7 @@ impl Client {
 
         let receipt = receipt.with_children(children);
         self.send_node(&receipt, sink).await?;
-        tracing::info!(
+        tracing::debug!(
             msg_id = %msg_id,
             to = %params.to,
             retry_count,
@@ -3434,7 +3444,6 @@ impl Client {
             .with_attr("push_priority", "high_force")
             .with_children(children);
 
-        tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
         self.send_node(&stanza, sink).await?;
         tracing::debug!(msg_id, jid, "peer data operation enviada");
         Ok(())
@@ -3661,12 +3670,12 @@ impl Client {
         // `willSendMessageAgain(ids[0], key.participant)`.
         let will_key = format!("{msg_id}:{}", participant.clone().unwrap_or_else(|| from.clone()));
         if self.msg_retry_cache.get(&will_key).await.unwrap_or(0) >= self.config.max_msg_retry_count {
-            tracing::info!(msg_id, "will not send message again, as sent too many times");
+            tracing::debug!(msg_id, "will not send message again, as sent too many times");
             return Ok(());
         }
         // `key.fromMe` do `handleReceipt` (`!attrs.recipient || isNodeFromMe` em retry).
         if !(recipient.is_none() || is_node_from_me) {
-            tracing::info!(msg_id, "recv retry for not fromMe message");
+            tracing::debug!(msg_id, "recv retry for not fromMe message");
             return Ok(());
         }
 
@@ -4072,9 +4081,8 @@ impl Client {
             }
             let stanza = stanza.with_children(children);
 
-            tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
             self.send_node(&stanza, sink).await?;
-            tracing::debug!(msg_id, jid, participant = %participant.jid, "mensagem 1:1 reenviada para participante (retry)");
+            tracing::info!(msg_id, jid, participant = %participant.jid, "mensagem 1:1 reenviada (retry)");
             return Ok(SendMessageResult { message_id: msg_id.to_string() });
         }
 
@@ -4209,8 +4217,6 @@ impl Client {
         }
         let stanza = stanza.with_children(children);
 
-        tracing::info!("STANZA_SEND\n{}", pretty_node(&stanza));
-
         self.send_node(&stanza, sink).await?;
 
         // Cache para reenvio em retry.
@@ -4228,7 +4234,7 @@ impl Client {
             });
         }
 
-        tracing::debug!(msg_id, jid, "mensagem enviada");
+        tracing::info!(msg_id, jid, kind = "1:1", devices = all_jids.len(), "mensagem enviada");
         Ok(SendMessageResult { message_id: msg_id.to_string() })
     }
 
@@ -4715,57 +4721,12 @@ impl Client {
             ));
         }
 
-        tracing::info!(
-            msg_id,
-            jid,
-            me_id = %me_id,
-            me_lid = %me_lid,
-            is_retry = participant.is_some(),
-            "SEND_GROUP: entrada"
-        );
-        tracing::info!(
-            msg_id,
-            "SEND_GROUP: authState.creds.account (console.dir)\n{}",
-            serde_json::to_string_pretty(
-                &self.store.creds().account.clone().unwrap_or(serde_json::Value::Null)
-            )
-            .unwrap_or_default()
-        );
-        tracing::info!(
-            msg_id,
-            "SEND_GROUP: message ANTES de criptografar (console.dir)\n{}",
-            pretty_proto(&message)
-        );
-
         let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
 
         // Metadados do grupo (participantes) — o retry com participant NÃO faz
         // fanout, mas ainda precisa do `addressing_mode` (Node linha 545).
         let meta = self.group_metadata(jid, sink).await?;
         let addressing_mode = meta.addressing_mode.as_deref().unwrap_or("pn");
-        tracing::info!(
-            msg_id,
-            group = jid,
-            addressing_mode,
-            participants_count = meta.participants.len(),
-            "SEND_GROUP: groupData (addressing_mode + participantes)"
-        );
-        tracing::info!(
-            msg_id,
-            "SEND_GROUP: groupData.participants\n{}",
-            serde_json::to_string_pretty(
-                &meta.participants
-                    .iter()
-                    .map(|p| serde_json::json!({
-                        "id": p.id,
-                        "jid": p.jid,
-                        "lid": p.lid,
-                        "admin": p.admin,
-                    }))
-                    .collect::<Vec<_>>()
-            )
-            .unwrap_or_default()
-        );
 
         // `isGroup && participant` (Node linhas 540–590): retry de grupo — a
         // mensagem volta como `senderKeyDistributionMessage` cifrada 1:1 para
@@ -4798,18 +4759,6 @@ impl Client {
                 &write_random_pad_max16(&message_to_send.encode_to_vec()),
             )?;
 
-            tracing::info!(
-                msg_id,
-                participant = %participant.jid,
-                count = participant.count,
-                participant_lid = ?lid,
-                dest,
-                enc_1to1_type = %enc_1to1.r#type,
-                ciphertext_len = enc_1to1.ciphertext.len(),
-                "SEND_GROUP: retry participant — messageToSend (console.dir)\n{}",
-                pretty_proto(&message_to_send)
-            );
-
             let pkmsg = enc_1to1.r#type == "pkmsg";
             let mut children = vec![retry_enc_node(&enc_1to1.r#type, enc_1to1.ciphertext, participant.count, &node_extra_attrs)];
             children.extend(self.relay_stanza_tail(pkmsg, lid.as_deref(), jid, false, None));
@@ -4831,9 +4780,8 @@ impl Client {
             }
             let stanza = stanza.with_children(children);
 
-            tracing::info!(msg_id, "SEND_GROUP: STANZA_SEND (retry)\n{}", pretty_node(&stanza));
             self.send_node(&stanza, sink).await?;
-            tracing::debug!(msg_id, jid, participant = %participant.jid, "mensagem de grupo reenviada para participante (retry)");
+            tracing::info!(msg_id, jid, participant = %participant.jid, "mensagem de grupo reenviada (retry)");
             return Ok(SendMessageResult { message_id: msg_id.to_string() });
         }
 
@@ -4843,15 +4791,6 @@ impl Client {
             &me_lid,
             &write_random_pad_max16(&patched.encode_to_vec()),
         )?;
-
-        tracing::info!(
-            msg_id,
-            group = jid,
-            me_lid,
-            skmsg_ciphertext_len = enc.ciphertext.len(),
-            skdm_len = enc.sender_key_distribution_message.len(),
-            "SEND_GROUP: encryptGroupMessage (ciphertext + senderKeyDistributionMessage)"
-        );
 
         // `isretry` sem participant (Node `if (!isretry)` pula o
         // `getUSyncDevices`): `devices` fica vazio, então não há
@@ -4869,8 +4808,8 @@ impl Client {
             }
             let stanza = stanza.with_attr("to", jid).with_children(children);
 
-            tracing::info!(msg_id, "SEND_GROUP: STANZA_SEND (isretry, sem participant)\n{}", pretty_node(&stanza));
             self.send_node(&stanza, sink).await?;
+            tracing::info!(msg_id, jid, "mensagem de grupo reenviada (isretry)");
             self.cache_send(msg_id.to_string(), jid.to_string(), message.encode_to_vec()).await;
             return Ok(SendMessageResult { message_id: msg_id.to_string() });
         }
@@ -4892,13 +4831,6 @@ impl Client {
 
         let mut devices = self.get_usync_devices(&participant_jids, sink, true).await?;
 
-        tracing::info!(
-            msg_id,
-            group = jid,
-            "SEND_GROUP: devices ANTES do fallback device 0 (getUSyncDevices)\n{}",
-            pretty_devices(&devices)
-        );
-
         // Garante nosso device 0 (primary) no fanout — paridade Node
         // (`messages-send.ts:679-684`): quando o USync não retornou o phone,
         // empurra DOIS entries — o entry LID (`jlidUser` → `meLid`) e o entry
@@ -4912,22 +4844,12 @@ impl Client {
         // sender key sob a identidade PN do remetente — e o WhatsApp do
         // destinatário imprime `numero:device@s.whatsapp.net` na bolha.
         let me_lid_user = jid_user(&me_lid).unwrap_or_default();
-        let me_id_user = jid_user(&me_id).unwrap_or_default();
         let has_me_phone = devices
             .iter()
             .any(|(u, d, _)| u == &me_lid_user && *d == 0);
         if !has_me_phone {
             devices.extend(device0_fallback_entries(&me_lid, &me_id, jid));
         }
-        tracing::info!(
-            msg_id,
-            has_me_phone,
-            me_lid_user = %me_lid_user,
-            me_id_user = %me_id_user,
-            dest_user = %jid_user(jid).unwrap_or_default(),
-            "SEND_GROUP: devices DEPOIS do fallback device 0\n{}",
-            pretty_devices(&devices)
-        );
 
         // senderKeyDistributionMessage como Message (port do `senderKeyMsg`).
         let sender_key_msg = wa::Message {
@@ -4941,13 +4863,6 @@ impl Client {
             ),
             ..Default::default()
         };
-
-        tracing::info!(
-            msg_id,
-            group = jid,
-            "SEND_GROUP: senderKeyMsg (SenderKeyDistributionMessage como Message, console.dir)\n{}",
-            pretty_proto(&sender_key_msg)
-        );
 
         let mut sender_key_jids: Vec<String> = Vec::new();
         // `sender-key-memory` do Node: `senderKeyMap[senderId] = true` — reuso
@@ -4970,26 +4885,8 @@ impl Client {
             sender_key_jids.push(sender_id);
         }
         if !sender_key_map.is_empty() {
-            tracing::info!(
-                msg_id,
-                group = jid,
-                "SEND_GROUP: senderKeyMap (sender-key-memory)\n{}",
-                serde_json::to_string_pretty(&serde_json::json!(sender_key_map)).unwrap_or_default()
-            );
             self.sender_key_memory.set(jid.to_string(), sender_key_map).await;
         }
-        tracing::info!(
-            msg_id,
-            group = jid,
-            "SEND_GROUP: senderKeyJids\n{}",
-            serde_json::to_string_pretty(&sender_key_jids).unwrap_or_default()
-        );
-        tracing::info!(
-            participants = sender_key_jids.len(),
-            group = jid,
-            msg_id,
-            "envio em grupo: fanout preparado"
-        );
 
         let mut participants: Vec<BinaryNode> = Vec::new();
         let mut should_include_device_identity = false;
@@ -5005,14 +4902,6 @@ impl Client {
                 if sk_enc.r#type == "pkmsg" {
                     should_include_device_identity = true;
                 }
-                tracing::info!(
-                    msg_id,
-                    sender_id = %sender_id,
-                    dest,
-                    enc_type = %sk_enc.r#type,
-                    ciphertext_len = sk_enc.ciphertext.len(),
-                    "SEND_GROUP: participant node (to/enc)"
-                );
                 participants.push(participant_enc_node(sender_id, &sk_enc.r#type, sk_enc.ciphertext, &node_extra_attrs));
             }
         }
@@ -5041,19 +4930,6 @@ impl Client {
         }
         let stanza = stanza.with_children(children);
 
-        tracing::debug!(
-            msg_id,
-            group = jid,
-            stanza_type = %stanza.attr("type").unwrap_or_default(),
-            to = %stanza.attr("to").unwrap_or_default(),
-            addressing_mode = %stanza.attr("addressing_mode").unwrap_or_default(),
-            participants = sender_key_jids.len(),
-            ?sender_key_jids,
-            "stanza de grupo preparado"
-        );
-
-        tracing::info!(msg_id, "SEND_GROUP: STANZA_SEND\n{}", pretty_node(&stanza));
-
         self.send_node(&stanza, sink).await?;
 
         // Cache para reenvio em retry.
@@ -5070,7 +4946,7 @@ impl Client {
             });
         }
 
-        tracing::debug!(msg_id, jid, "mensagem de grupo enviada");
+        tracing::info!(msg_id, jid, kind = "grupo", devices = sender_key_jids.len(), "mensagem enviada");
         Ok(SendMessageResult { message_id: msg_id.to_string() })
     }
 
@@ -6100,73 +5976,6 @@ fn get_status_from_receipt_type(r#type: Option<&str>) -> Option<i32> {
         None => Some(wa::web_message_info::Status::DeliveryAck as i32),
         _ => None,
     }
-}
-
-/// Pretty-print de um `BinaryNode` no shape do `console.dir(stanza, { depth: null })`
-/// do Node/Hineken: `{ tag, attrs: {objeto}, content }`, com bytes em hex
-/// (`<0a 12 ...>`), multilinha e indentação de 2 espaços. Usado nos logs
-/// `STANZA_SEND` para diff linha a linha com o TS.
-fn pretty_node(node: &baileys_core::BinaryNode) -> String {
-    serde_json::to_string_pretty(&pretty_node_value(node)).unwrap_or_default()
-}
-
-fn pretty_node_value(node: &baileys_core::BinaryNode) -> serde_json::Value {
-    // `attrs` vira objeto (como no Node), não `[["k","v"], ...]`. Chave
-    // duplicada → a última vence (mesmo efeito de sobrescrever no objeto JS).
-    let mut attrs = serde_json::Map::new();
-    for (k, v) in &node.attrs {
-        attrs.insert(k.clone(), serde_json::Value::String(v.clone()));
-    }
-
-    let content = match &node.content {
-        Some(baileys_core::BinaryContent::Children(children)) => {
-            serde_json::Value::Array(children.iter().map(pretty_node_value).collect())
-        }
-        Some(baileys_core::BinaryContent::String(s)) => serde_json::Value::String(s.clone()),
-        Some(baileys_core::BinaryContent::Bytes(b)) => {
-            // Espelha o `<Buffer 0a 12 34 ...>` do Node, truncando como o
-            // `inspect` faz para buffers grandes (legível para o diff).
-            let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
-            let shown = if hex.len() > 128 {
-                let mut v = hex[..128].to_vec();
-                v.push("...".to_string());
-                v
-            } else {
-                hex
-            };
-            serde_json::Value::String(format!("<{}>", shown.join(" ")))
-        }
-        None => serde_json::Value::Null,
-    };
-
-    serde_json::json!({
-        "tag": node.tag,
-        "attrs": serde_json::Value::Object(attrs),
-        "content": content,
-    })
-}
-
-/// Pretty-print de uma mensagem prost no shape do `console.dir(msg, { depth: null })`
-/// do Node: JSON camelCase (mesmo serializador usado nos webhooks), com campos
-/// vazios omitidos. Usado nos logs de diagnóstico do envio em grupo.
-fn pretty_proto(msg: &impl prost_reflect::ReflectMessage) -> String {
-    serde_json::to_string_pretty(&baileys_proto::proto_to_json_value(msg)).unwrap_or_default()
-}
-
-/// Serializa devices `(user, device, jid)` no shape do array de objects do Node:
-/// `[ { user, device, jid }, ... ]`.
-fn pretty_devices(devices: &[(String, u32, String)]) -> String {
-    let arr: Vec<serde_json::Value> = devices
-        .iter()
-        .map(|(user, device, jid)| {
-            serde_json::json!({
-                "user": user,
-                "device": device,
-                "jid": jid,
-            })
-        })
-        .collect();
-    serde_json::to_string_pretty(&arr).unwrap_or_default()
 }
 
 /// `unixTimestampSeconds()`.

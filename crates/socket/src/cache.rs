@@ -14,7 +14,8 @@
 //! usam `cache:global:{namespace}`; caches por conexão usam
 //! `cache:instance:{instanceKey}:{namespace}` (definido pelo app).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,8 +65,11 @@ pub struct TtlCache<T> {
     /// Prefixo das chaves repassadas ao backend (ex.: `cache:global:devices`).
     namespace: std::sync::Mutex<String>,
     backend: std::sync::Mutex<Option<Arc<dyn CacheStore>>>,
-    /// Chaves gravadas por este cache (para o `clear`/`flushAll` no backend).
-    known_keys: std::sync::Mutex<HashSet<String>>,
+    /// Chaves gravadas → expiração, só quando o `clear`/`flushAll` é usado
+    /// (`with_flush_tracking`). `None` = sem rastreio.
+    known_keys: std::sync::Mutex<Option<HashMap<String, Instant>>>,
+    /// `cacheControl`: desligado, `get` sempre erra e `set` não grava.
+    enabled: AtomicBool,
 }
 
 impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
@@ -76,7 +80,35 @@ impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
             max_keys,
             namespace: std::sync::Mutex::new(String::new()),
             backend: std::sync::Mutex::new(None),
-            known_keys: std::sync::Mutex::new(HashSet::new()),
+            known_keys: std::sync::Mutex::new(None),
+            enabled: AtomicBool::new(true),
+        }
+    }
+
+    /// Liga o rastreio de chaves exigido pelo `clear()` (com expiração).
+    pub fn with_flush_tracking(self) -> Self {
+        *self.known_keys.lock().unwrap() = Some(HashMap::new());
+        self
+    }
+
+    /// Liga/desliga o cache (`cacheControl`).
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    fn track_key(&self, key: &str, ttl: Duration) {
+        let mut guard = self.known_keys.lock().unwrap();
+        let Some(keys) = guard.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        keys.insert(key.to_string(), now + ttl);
+        if keys.len() > self.max_keys {
+            keys.retain(|_, expires_at| *expires_at > now);
         }
     }
 
@@ -97,6 +129,9 @@ impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
     }
 
     pub async fn get(&self, key: &str) -> Option<T> {
+        if !self.is_enabled() {
+            return None;
+        }
         // Backend primeiro.
         let backend = self.backend.lock().unwrap().clone();
         let backend_key = self.backend_key(key);
@@ -126,7 +161,10 @@ impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
     }
 
     pub async fn set_with_ttl(&self, key: String, value: T, ttl: Duration) {
-        self.known_keys.lock().unwrap().insert(key.clone());
+        if !self.is_enabled() {
+            return;
+        }
+        self.track_key(&key, ttl);
         // Tenta o backend primeiro (JSON + TTL em segundos).
         let backend = self.backend.lock().unwrap().clone();
         let backend_key = self.backend_key(&key);
@@ -174,12 +212,21 @@ impl<T: Clone + serde::Serialize + serde::de::DeserializeOwned> TtlCache<T> {
             let _ = backend.remove(&backend_key).await;
         }
         self.inner.lock().await.remove(key);
-        self.known_keys.lock().unwrap().remove(key);
+        if let Some(keys) = self.known_keys.lock().unwrap().as_mut() {
+            keys.remove(key);
+        }
     }
 
-    /// `flushAll` do node-cache: remove todas as chaves gravadas por este cache.
+    /// `flushAll` do node-cache: remove as chaves rastreadas (exige
+    /// `with_flush_tracking`) e limpa a memória.
     pub async fn clear(&self) {
-        let keys: Vec<String> = self.known_keys.lock().unwrap().drain().collect();
+        let keys: Vec<String> = self
+            .known_keys
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|k| k.drain().map(|(key, _)| key).collect())
+            .unwrap_or_default();
         let backend = self.backend.lock().unwrap().clone();
         if let Some(backend) = backend {
             for key in &keys {
