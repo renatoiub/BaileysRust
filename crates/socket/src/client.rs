@@ -444,6 +444,8 @@ pub struct Client {
     noise: Mutex<Option<Arc<Mutex<NoiseHandler>>>>,
     /// Último código de desconexão (para o loop de reconnect do container).
     last_close_code: AtomicI32,
+    /// `true` entre o `connection: "open"` e o `connection: "close"`.
+    open: std::sync::atomic::AtomicBool,
     /// Handle da task de rotação de QR (para cancelar ao parear).
     qr_rotation: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Cache de envio: `msg_id` → `(destino, Message codificado)` para o
@@ -502,7 +504,9 @@ impl Client {
             sqlite.save_creds(&creds)?;
         }
         let store = Arc::new(SqliteSignalStore::new(sqlite.clone())?);
-        let (events, _) = tokio::sync::broadcast::channel(64);
+        // Folga para a rajada de mensagens offline no reconnect: um receiver
+        // que fica para trás perde eventos (`Lagged`).
+        let (events, _) = tokio::sync::broadcast::channel(4096);
 
         let client = Self {
             store,
@@ -514,6 +518,7 @@ impl Client {
             sink: Mutex::new(None),
             noise: Mutex::new(None),
             last_close_code: AtomicI32::new(0),
+            open: std::sync::atomic::AtomicBool::new(false),
             qr_rotation: Mutex::new(None),
             send_cache: Mutex::new(HashMap::new()),
             send_cache_order: Mutex::new(Vec::new()),
@@ -577,6 +582,11 @@ impl Client {
     /// Último código de desconexão (0 = nunca desconectou).
     pub fn last_close_code(&self) -> i32 {
         self.last_close_code.load(Ordering::SeqCst)
+    }
+
+    /// Conexão logada e aberta (`connection: "open"` sem `close` depois).
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
     }
 
     /// Assina o fluxo de eventos.
@@ -691,6 +701,8 @@ impl Client {
             Err(e) => self.error_to_close(e),
         };
         self.last_close_code.store(status_code, Ordering::SeqCst);
+        self.open.store(false, Ordering::SeqCst);
+        *self.sink.lock().await = None;
         let _ = self.events.send(ClientEvent::ConnectionUpdate(ConnectionUpdate {
             connection: "close".to_string(),
             status_code: Some(status_code),
@@ -1665,6 +1677,7 @@ impl Client {
             .with_children(vec![BinaryNode::new("active")]);
         self.query_node(active, sink).await?;
 
+        self.open.store(true, Ordering::SeqCst);
         let _ = self.events.send(ClientEvent::ConnectionUpdate(ConnectionUpdate {
             connection: "open".to_string(),
             ..Default::default()
