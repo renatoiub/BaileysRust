@@ -1958,10 +1958,42 @@ impl Client {
             raw: node.clone(),
             key_extras: key_extras.clone(),
         });
+        self.update_push_name_from_message(&info, sink).await;
         tracing::debug!(from = %from, msg_id = %msg_id, "evento Message emitido");
 
         self.process_message(&info, &key_extras, sink).await;
         Ok(())
+    }
+
+    /// `upsertMessage` ("update our pushname too") + hook `creds.update` do
+    /// socket: mensagem minha com `pushName` diferente do `me.name` grava o
+    /// nome e reenvia `<presence name>` (sem `type`).
+    async fn update_push_name_from_message(&self, info: &wa::WebMessageInfo, sink: &WsSink) {
+        let from_me = info.key.as_ref().and_then(|k| k.from_me).unwrap_or(false);
+        let Some(push_name) = info.push_name.as_deref().filter(|n| !n.is_empty()) else {
+            return;
+        };
+        if !from_me {
+            return;
+        }
+        let mut creds = self.store.creds();
+        let Some(me) = creds.me.as_mut() else {
+            return;
+        };
+        if me.name.as_deref() == Some(push_name) {
+            return;
+        }
+        me.name = Some(push_name.to_string());
+        if let Err(e) = self.store.update_creds(creds.clone()) {
+            tracing::warn!(error = %e, "falha ao gravar pushName no creds");
+            return;
+        }
+        let _ = self.events.send(ClientEvent::CredsUpdate(creds));
+        tracing::debug!(name = push_name, "updated pushName");
+        let presence = BinaryNode::new("presence").with_attr("name", push_name);
+        if let Err(e) = self.send_node(&presence, sink).await {
+            tracing::warn!(error = %e, "error in sending presence update on name change");
+        }
     }
 
     /// `shouldIgnoreJid` do container (`ignoreGroups`).
@@ -5278,22 +5310,33 @@ impl Client {
         let me_id = me.id;
         let me_lid = me.lid.unwrap_or_default();
 
-        if matches!(presence_type, "available" | "unavailable") {
-            // `ev.emit('connection.update', { isOnline })` → `sendActiveReceipts`.
-            self.send_active_receipts
-                .store(presence_type == "available", Ordering::Relaxed);
-        }
         let node = match presence_type {
-            "available" | "unavailable" => BinaryNode::new("presence")
-                .with_attr("name", me_id.replace('@', ""))
-                .with_attr("type", presence_type),
+            "available" | "unavailable" => {
+                // `name` é o pushName da conta (`me.name`), nunca o JID: o
+                // servidor grava esse valor como nome de perfil.
+                let Some(name) = me.name.filter(|n| !n.is_empty()) else {
+                    tracing::warn!("no name present, ignoring presence update request...");
+                    return Ok(());
+                };
+                // `ev.emit('connection.update', { isOnline })` → `sendActiveReceipts`.
+                self.send_active_receipts
+                    .store(presence_type == "available", Ordering::Relaxed);
+                BinaryNode::new("presence")
+                    .with_attr("name", name.replace('@', ""))
+                    .with_attr("type", presence_type)
+            }
             _ => {
                 let to = to_jid.unwrap_or_default();
-                let from = if baileys_core::is_lid_user(&to) { me_lid } else { me_id };
+                let from = if baileys_core::is_lid_user(to) { me_lid } else { me_id };
+                let state = if presence_type == "recording" {
+                    BinaryNode::new("composing").with_attr("media", "audio")
+                } else {
+                    BinaryNode::new(presence_type)
+                };
                 BinaryNode::new("chatstate")
                     .with_attr("from", from)
                     .with_attr("to", to)
-                    .with_children(vec![BinaryNode::new(presence_type)])
+                    .with_children(vec![state])
             }
         };
         self.send_node(&node, sink).await
