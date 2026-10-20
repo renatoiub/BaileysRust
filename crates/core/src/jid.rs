@@ -58,10 +58,13 @@ pub struct FullJid {
 }
 
 /// `jidEncode` — monta um JID a partir das partes.
+///
+/// Node: `${device ? `:${device}` : ''}` — device `0` é falsy e não entra no
+/// JID (o AD_JID do phone decodifica como `user@lid`, não `user:0@lid`).
 pub fn jid_encode(user: &str, server: JidServer, device: Option<u32>) -> String {
     let device = match device {
-        Some(d) => format!(":{d}"),
-        None => String::new(),
+        Some(d) if d != 0 => format!(":{d}"),
+        _ => String::new(),
     };
     format!("{user}{device}@{}", server.as_str())
 }
@@ -148,6 +151,12 @@ mod tests {
     fn device_jid() {
         let decoded = jid_decode("5511999999999:12@s.whatsapp.net").unwrap();
         assert_eq!(decoded.device, Some(12));
+    }
+
+    #[test]
+    fn encode_omits_device_zero() {
+        assert_eq!(jid_encode("78915880149164", JidServer::Lid, Some(0)), "78915880149164@lid");
+        assert_eq!(jid_encode("78915880149164", JidServer::Lid, Some(35)), "78915880149164:35@lid");
     }
 
     #[test]

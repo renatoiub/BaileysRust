@@ -308,6 +308,13 @@ mod tests {
     }
 
     #[test]
+    fn ad_jid_device_zero_decodes_without_suffix() {
+        let node = BinaryNode::new("participant").with_attr("jid", "78915880149164:0@lid");
+        let decoded = decode_binary_node(&encode_binary_node(&node)).unwrap();
+        assert_eq!(decoded.attr("jid"), Some("78915880149164@lid"));
+    }
+
+    #[test]
     fn ad_jid_swhatsapp_device_roundtrip() {
         // Um JID de device `@s.whatsapp.net` deve codificar com domainType=0.
         let node = BinaryNode::new("user").with_attr("jid", "5511999999999:12@s.whatsapp.net");

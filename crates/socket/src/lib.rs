@@ -7,6 +7,7 @@ pub mod handshake;
 pub mod link_preview;
 pub mod media;
 pub mod noise;
+pub mod reporting;
 pub mod usync;
 
 pub use cache::{CacheStore, TtlCache};
