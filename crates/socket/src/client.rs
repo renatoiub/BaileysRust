@@ -2748,22 +2748,40 @@ impl Client {
             .and_then(|m| m.lid)
             .unwrap_or_else(|| me_id.clone());
 
-        // Port de `handleReceipt` (Node): `isNodeFromMe`, `remoteJid`, `retryParticipantJid`.
+        // Port EXATO do bloco retry de `handleReceipt` (Node,
+        // messages-recv.js:690-693):
+        //   const isLid = attrs.from.includes('lid');
+        //   const isNodeFromMe = areJidsSameUser(attrs.participant || attrs.from,
+        //       isLid ? me.lid : me.id);
+        //   const remoteJid = !isNodeFromMe || isJidGroup(attrs.from) ||
+        //       !attrs.recipient ? attrs.from : attrs.recipient;
+        let is_lid = from.contains("lid");
         let p_or_from = participant.clone().unwrap_or_else(|| from.clone());
-        let is_node_from_me = are_jids_same_user(&p_or_from, &me_id)
-            || (!me_lid.is_empty() && are_jids_same_user(&p_or_from, &me_lid));
-        let remote = if !is_node_from_me || baileys_core::is_jid_group(&from) {
+        let is_node_from_me = if is_lid {
+            are_jids_same_user(&p_or_from, &me_lid)
+        } else {
+            are_jids_same_user(&p_or_from, &me_id)
+        };
+        let remote = if !is_node_from_me || baileys_core::is_jid_group(&from) || recipient.is_none() {
             from.clone()
         } else {
-            recipient.clone().unwrap_or_else(|| from.clone())
+            recipient.clone().unwrap_or_default()
         };
 
-        // `retryParticipantJid = attrs.participant || (attrs.from, se não for grupo)`.
-        let retry_participant = participant.clone().unwrap_or_else(|| {
+        // `retryParticipantJid = attrs.participant || (!isJidGroup(attrs.from) ?
+        // attrs.from : undefined)` (Node `handleReceipt`, messages-recv.js:693).
+        //
+        // IMPORTANTE: para grupo SEM `attrs.participant`, o Node deixa
+        // `retryParticipantJid` como `undefined` (NÃO usa o jid do grupo). Isso
+        // faz `relayMessage` cair no branch `isGroup && !participant` com
+        // `isretry` — reenvia SÓ o `skmsg`, sem fanout e sem distribuir sender
+        // key. O `sendMessagesAgain` (com `sendToAll`) é código MORTO no Node;
+        // o fluxo real não decide por device.
+        let retry_participant: Option<String> = participant.clone().or_else(|| {
             if !baileys_core::is_jid_group(&from) {
-                from.clone()
+                Some(from.clone())
             } else {
-                remote.clone()
+                None
             }
         });
 
@@ -2813,6 +2831,9 @@ impl Client {
 
         // Tenta extrair e injetar a sessão E2E do bundle `<keys>` do retry
         // (port de `extractE2ESessionFromRetryReceipt`).
+        //
+        // Node: `if (bundle && retryParticipantJid)` — só injeta quando há
+        // `retryParticipantJid`. Para grupo sem participant, não há bundle.
         let mut injected_from_bundle = false;
         let child_tags: Vec<String> = match &node.content {
             Some(baileys_core::BinaryContent::Children(children)) => {
@@ -2820,8 +2841,8 @@ impl Client {
             }
             _ => Vec::new(),
         };
-        tracing::debug!(msg_id, from = %from, ?child_tags, "retry receipt recebido");
-        if let Some(keys) = node.child("keys") {
+        tracing::debug!(msg_id, from = %from, ?child_tags, retry_participant, "retry receipt recebido");
+        if let (Some(retry_participant_jid), Some(keys)) = (retry_participant.as_deref(), node.child("keys")) {
             let identity = keys.child_bytes("identity").map(|b| b.to_vec());
             let skey = keys.child("skey");
             let pre_key = keys.child("key");
@@ -2855,7 +2876,7 @@ impl Client {
             );
             if let (Some(identity), Some((sk_id, sk_pub)), Some(sk_sig), Some((pk_id, pk_pub)), Some(registration)) = bundle {
                 let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
-                let dest = convert_lid_device(&retry_participant, lid.as_deref(), &me_id, &me_lid);
+                let dest = convert_lid_device(retry_participant_jid, lid.as_deref(), &me_id, &me_lid);
                 match repo.inject_e2e_session(
                     &dest,
                     InjectSession {
@@ -2874,10 +2895,10 @@ impl Client {
                     },
                 ) {
                     Ok(()) => {
-                        tracing::debug!(retry_participant, dest, "sessão E2E injetada do bundle de retry");
+                        tracing::debug!(retry_participant_jid, dest, "sessão E2E injetada do bundle de retry");
                         injected_from_bundle = true;
                     }
-                    Err(e) => tracing::warn!(retry_participant, error = %e, "falha ao injetar bundle de retry"),
+                    Err(e) => tracing::warn!(retry_participant_jid, error = %e, "falha ao injetar bundle de retry"),
                 }
             } else {
                 tracing::debug!(msg_id, has_keys = true, has_identity = identity.is_some(), "bundle de retry incompleto");
@@ -2887,16 +2908,21 @@ impl Client {
         // Sem bundle injetado → re-garante sessão com o participante.
         // `force` segue o `forceSession` do Node: forçado na primeira vez,
         // depois reusa.
+        //
+        // Node: `if (!injectedFromBundle && retryParticipantJid)` — para grupo
+        // sem participant, NÃO re-garante sessão (não há device alvo).
         if !injected_from_bundle {
-            let force = {
-                if self.force_session_cache.contains(&retry_participant).await {
-                    false
-                } else {
-                    self.force_session_cache.set(retry_participant.clone(), ()).await;
-                    true
-                }
-            };
-            self.assert_sessions(&[retry_participant.clone()], force, lid.as_deref(), sink).await?;
+            if let Some(retry_participant_jid) = retry_participant.as_deref() {
+                let force = {
+                    if self.force_session_cache.contains(retry_participant_jid).await {
+                        false
+                    } else {
+                        self.force_session_cache.set(retry_participant_jid.to_string(), ()).await;
+                        true
+                    }
+                };
+                self.assert_sessions(&[retry_participant_jid.to_string()], force, lid.as_deref(), sink).await?;
+            }
         }
 
         // Node `messages-recv.ts:898`: antes do reenvio em grupo, apaga a
@@ -2912,49 +2938,67 @@ impl Client {
         let mut msg = wa::Message::decode(cached_bytes.as_slice()).unwrap_or_default();
         msg.message_context_info = None;
 
-        // `retryNode.attrs.count` (Node `messages-recv.ts:881`).
+        // `retryNode.attrs.count` (Node `messages-recv.js:711`).
         let retry_count = node
             .child("retry")
             .and_then(|r| r.attr("count"))
             .and_then(|c| c.parse::<u32>().ok())
             .unwrap_or(1);
 
-        let relay_participant = RelayParticipant {
-            jid: retry_participant.clone(),
-            count: retry_count.max(1),
-        };
-
-        // Node `sendMessagesAgain` (messages-recv.js:569-572): se o pedinte é o
-        // device primário (sem `:device`), reenvia para TODOS (`sendToAll`) —
-        // previne a falha de decriptação da primeira mensagem. Só o device
-        // secundário (com `:device`) recebe o retry 1:1 direcionado.
-        let send_to_all = jid_device(&retry_participant).map_or(true, |d| d == 0);
-
-        let result = if baileys_core::is_jid_group(&target_jid) {
-            if send_to_all {
-                self.send_group(&target_jid, msg, &msg_id, sink, &[], None, true)
+        // Node `handleReceipt`: `msgRelayOpts = { messageId: key.id, isretry: true }`
+        // e, SÓ se `retryParticipantJid` existir, `msgRelayOpts.participant =
+        // { jid, count }`. NÃO existe `sendToAll` no fluxo real (o
+        // `sendMessagesAgain` é código morto); a decisão é exclusivamente a
+        // presença/ausência do `retryParticipantJid`.
+        //
+        // - Grupo COM participant → `relayMessage(jid, msg, { participant })` →
+        //   `isGroup && participant` (senderKeyDistributionMessage 1:1 só para
+        //   o pedinte).
+        // - Grupo SEM participant → `relayMessage(jid, msg, { isretry })` →
+        //   `isGroup && !participant` com `isretry`: reenvia SÓ o `skmsg`,
+        //   sem fanout (`getUSyncDevices` é pulado por `!isretry`) e sem
+        //   distribuir sender key (`devices` vazio → `senderKeyJids` vazio).
+        // - 1:1 → `participant && !isGroup` (1:1 direcionado ao pedinte).
+        let result = match retry_participant.as_deref() {
+            Some(retry_participant_jid) => {
+                let relay_participant = RelayParticipant {
+                    jid: retry_participant_jid.to_string(),
+                    count: retry_count.max(1),
+                };
+                if baileys_core::is_jid_group(&target_jid) {
+                    self.relay_group_message_retry(
+                        &target_jid,
+                        msg,
+                        &msg_id,
+                        &relay_participant,
+                        sink,
+                        &[],
+                    )
                     .await
-            } else {
-                self.relay_group_message_retry(
-                    &target_jid,
-                    msg,
-                    &msg_id,
-                    &relay_participant,
-                    sink,
-                    &[],
-                )
-                .await
+                } else {
+                    self.relay_message_retry(
+                        &target_jid,
+                        msg,
+                        &msg_id,
+                        &relay_participant,
+                        sink,
+                        &[],
+                    )
+                    .await
+                }
             }
-        } else {
-            self.relay_message_retry(
-                &target_jid,
-                msg,
-                &msg_id,
-                &relay_participant,
-                sink,
-                &[],
-            )
-            .await
+            None => {
+                // Grupo sem participant: reenvia SÓ o skmsg (isretry, sem
+                // participant). Para 1:1, o Node sempre tem `retryParticipantJid`
+                // (`attrs.participant || attrs.from`), então `None` só ocorre em
+                // grupo; por segurança, trata como no-op se não for grupo.
+                if baileys_core::is_jid_group(&target_jid) {
+                    self.send_group(&target_jid, msg, &msg_id, sink, &[], None, true)
+                        .await
+                } else {
+                    Ok(SendMessageResult { message_id: msg_id.to_string() })
+                }
+            }
         };
         result.map(|_| ())
     }
