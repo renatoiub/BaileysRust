@@ -1146,6 +1146,7 @@ impl Client {
                 match node.attr("type") {
                     Some("w:gp2") => self.handle_group_notification(node).await,
                     Some("devices") => self.handle_devices_notification(node, sink).await,
+                    Some("privacy_token") => self.handle_privacy_token_notification(node),
                     Some("server_sync") => {
                         // `resyncAppState([name], false)` — fora do loop de leitura (faz query).
                         if let Some(name) = node.child("collection").and_then(|c| c.attr("name")) {
@@ -2974,6 +2975,21 @@ impl Client {
         }
 
         if let Some(h) = history {
+            // `processHistoryMessage`: tcToken das conversas → `contacts-tc-token`
+            // (chave `lidJid || id`).
+            for chat in &h.conversations {
+                let Some(token) = chat.tc_token.as_deref().filter(|t| !t.is_empty()) else {
+                    continue;
+                };
+                let label = chat.lid_jid.as_deref().filter(|l| !l.is_empty()).unwrap_or(&chat.id);
+                self.store_tc_token(
+                    label,
+                    token,
+                    chat.tc_token_timestamp.map(|t| t.to_string()),
+                    chat.tc_token_sender_timestamp.map(|t| t as i64),
+                );
+            }
+
             // `messages` extraído direto (sem reter `Conversation`
             // completo: o consumidor só usa `data.messages`).
             let messages: Vec<wa::WebMessageInfo> = h
@@ -4113,13 +4129,9 @@ impl Client {
 
             let mut children = vec![retry_enc_node(&enc.r#type, enc.ciphertext, participant.count, &node_extra_attrs)];
             let destination_jid = baileys_core::jid_normalized_user(jid);
-            children.extend(self.relay_stanza_tail(
-                enc.r#type == "pkmsg",
-                lid.as_deref(),
-                &destination_jid,
-                false,
-                None,
-            ));
+            children.extend(
+                self.relay_stanza_tail(enc.r#type == "pkmsg", lid.as_deref(), &destination_jid, false, None).0,
+            );
 
             // Node linhas 857–865: `to = participant.jid`; se device nosso,
             // `recipient = destinationJid`. `device_fanout=false`.
@@ -4255,13 +4267,14 @@ impl Client {
 
         let mut children = vec![BinaryNode::new("participants").with_children(participants)];
         let destination_jid = baileys_core::jid_normalized_user(jid);
-        children.extend(self.relay_stanza_tail(
+        let (tail, tc_sender_timestamp) = self.relay_stanza_tail(
             should_include_device_identity,
             lid.as_deref(),
             &destination_jid,
             true,
             Some((&other_msg, msg_id, None)),
-        ));
+        );
+        children.extend(tail);
 
         let mut stanza = BinaryNode::new("message")
             .with_attr("id", msg_id)
@@ -4278,6 +4291,10 @@ impl Client {
         let stanza = stanza.with_children(children);
 
         self.send_node(&stanza, sink).await?;
+
+        if tc_sender_timestamp.is_some_and(should_send_new_tc_token) {
+            self.issue_privacy_token(&destination_jid, sink).await;
+        }
 
         // Cache para reenvio em retry.
         self.cache_send(msg_id.to_string(), jid.to_string(), message.encode_to_vec()).await;
@@ -4821,7 +4838,7 @@ impl Client {
 
             let pkmsg = enc_1to1.r#type == "pkmsg";
             let mut children = vec![retry_enc_node(&enc_1to1.r#type, enc_1to1.ciphertext, participant.count, &node_extra_attrs)];
-            children.extend(self.relay_stanza_tail(pkmsg, lid.as_deref(), jid, false, None));
+            children.extend(self.relay_stanza_tail(pkmsg, lid.as_deref(), jid, false, None).0);
 
             // Node linha 654: `stanza.attrs.to = destinationJid` +
             // `stanza.attrs.participant = participant.jid`.
@@ -4857,7 +4874,7 @@ impl Client {
         // `senderKeyJids`/`<participants>`/`device-identity` — só o `skmsg`.
         if is_retry {
             let mut children = vec![skmsg_enc_node(enc.ciphertext)];
-            children.extend(self.relay_stanza_tail(false, None, jid, false, None));
+            children.extend(self.relay_stanza_tail(false, None, jid, false, None).0);
 
             let mut stanza = BinaryNode::new("message")
                 .with_attr("id", msg_id)
@@ -4972,13 +4989,9 @@ impl Client {
         if !participants.is_empty() {
             children.push(BinaryNode::new("participants").with_children(participants));
         }
-        children.extend(self.relay_stanza_tail(
-            should_include_device_identity,
-            None,
-            jid,
-            false,
-            Some((&patched, msg_id, None)),
-        ));
+        children.extend(
+            self.relay_stanza_tail(should_include_device_identity, None, jid, false, Some((&patched, msg_id, None))).0,
+        );
 
         let mut stanza = BinaryNode::new("message")
             .with_attr("id", msg_id)
@@ -5036,9 +5049,69 @@ impl Client {
         self.get_lid(jid, sink).await
     }
 
+    /// `handlePrivacyTokenNotification` + `chats.update { tcToken }` do
+    /// `processNotification` (`case 'privacy_token'`).
+    fn handle_privacy_token_notification(&self, node: &BinaryNode) {
+        let Some(tokens) = node.child("tokens") else {
+            return;
+        };
+        let from = baileys_core::jid_normalized_user(node.attr("from").unwrap_or_default());
+        let issue_timestamp = chrono_now_secs() as i64;
+        let mut chats = Vec::new();
+        for token_node in tokens.children("token") {
+            let Some(BinaryContent::Bytes(content)) = &token_node.content else {
+                continue;
+            };
+            if token_node.attr("type") == Some("trusted_contact") {
+                tracing::debug!(from = %from, "received trusted contact token");
+                self.store_tc_token(
+                    &from,
+                    content,
+                    token_node.attr("t").map(String::from),
+                    Some(issue_timestamp),
+                );
+            }
+            chats.push(ChatUpdate {
+                id: token_node.attr("jid").unwrap_or_default().to_string(),
+                tc_token: Some(content.to_vec()),
+                ..Default::default()
+            });
+        }
+        if !chats.is_empty() {
+            let _ = self.events.send(ClientEvent::ChatsUpdate { chats });
+        }
+    }
+
+    /// `authState.keys.set({ 'contacts-tc-token': { [jid]: { token, timestamp, senderTimestamp } } })`
+    /// — BufferJSON igual ao Node (Redis `auth:{key}:contacts-tc-token-{jid}`).
+    fn store_tc_token(&self, jid: &str, token: &[u8], timestamp: Option<String>, sender_timestamp: Option<i64>) {
+        if jid.is_empty() || token.is_empty() {
+            return;
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "token".into(),
+            serde_json::json!({
+                "type": "Buffer",
+                "data": base64::engine::general_purpose::STANDARD.encode(token),
+            }),
+        );
+        if let Some(ts) = timestamp {
+            entry.insert("timestamp".into(), serde_json::Value::String(ts));
+        }
+        if let Some(sender_ts) = sender_timestamp {
+            entry.insert("senderTimestamp".into(), serde_json::Value::from(sender_ts));
+        }
+        let json = serde_json::Value::Object(entry).to_string();
+        self.store.store_generic("contacts-tc-token", jid, &json);
+    }
+
     /// Cauda do stanza do `relayMessage` (Node linhas 671–744), na ordem:
     /// `device-identity`, `cstoken`, `reporting`, `tctoken`. `reporting` é
     /// `None` em retry (`!isretry`); `tctoken` só existe em `is1on1Send`.
+    ///
+    /// Devolve também o `tcSenderTimestamp` (timestamp do token válido), usado
+    /// para reemitir o token depois do envio.
     fn relay_stanza_tail(
         &self,
         include_device_identity: bool,
@@ -5046,7 +5119,7 @@ impl Client {
         destination_jid: &str,
         is_1on1_send: bool,
         reporting: Option<(&wa::Message, &str, Option<&str>)>,
-    ) -> Vec<BinaryNode> {
+    ) -> (Vec<BinaryNode>, Option<i64>) {
         let mut nodes = Vec::new();
         if include_device_identity {
             if let Some(account) = self.store.creds().account {
@@ -5058,6 +5131,7 @@ impl Client {
 
         let tc_token_jid = lids.unwrap_or(destination_jid);
         let mut tc_token_buffer: Option<Vec<u8>> = None;
+        let mut tc_sender_timestamp: Option<i64> = None;
         if is_1on1_send {
             let mut tc_token_expired = true;
             if let Some(raw) = self.store.load_generic("contacts-tc-token", tc_token_jid) {
@@ -5075,12 +5149,16 @@ impl Client {
                         _ => None,
                     }) {
                         tc_token_expired = is_tc_token_expired(Some(&ts));
+                        if tc_token_buffer.is_some() {
+                            tc_sender_timestamp = ts.parse::<i64>().ok();
+                        }
                     }
                 }
             }
             if tc_token_buffer.is_some() && tc_token_expired {
                 tracing::debug!(jid = destination_jid, "tctoken expirado, limpando");
                 tc_token_buffer = None;
+                tc_sender_timestamp = None;
                 self.store.remove_generic("contacts-tc-token", tc_token_jid);
             }
         }
@@ -5113,7 +5191,29 @@ impl Client {
         if let Some(token) = tc_token_buffer {
             nodes.push(BinaryNode::new("tctoken").with_bytes(token));
         }
-        nodes
+        (nodes, tc_sender_timestamp)
+    }
+
+    /// Reemissão do privacy token depois do envio 1:1 (`shouldSendNewTcToken`
+    /// → `iq set xmlns="privacy"`). Sem aguardar a resposta, como o
+    /// fire-and-forget do Node.
+    async fn issue_privacy_token(&self, destination_jid: &str, sink: &WsSink) {
+        let t = chrono_now_secs().to_string();
+        let iq = BinaryNode::new("iq")
+            .with_attr("id", self.next_tag())
+            .with_attr("to", S_WHATSAPP_NET)
+            .with_attr("type", "set")
+            .with_attr("xmlns", "privacy")
+            .with_children(vec![BinaryNode::new("tokens").with_children(vec![
+                BinaryNode::new("token")
+                    .with_attr("jid", baileys_core::jid_normalized_user(destination_jid))
+                    .with_attr("t", t)
+                    .with_attr("type", "trusted_contact"),
+            ])]);
+        match self.send_node(&iq, sink).await {
+            Ok(_) => tracing::debug!(jid = destination_jid, "issued privacy token after send"),
+            Err(e) => tracing::debug!(jid = destination_jid, error = %e, "falha ao reemitir privacy token"),
+        }
     }
 
     /// `getLid` — resolve o LID de um JID `@s.whatsapp.net` via USync
@@ -6061,6 +6161,14 @@ fn is_tc_token_expired(timestamp: Option<&str>) -> bool {
     let cutoff_bucket = current_bucket - (NUM_BUCKETS - 1);
     let cutoff_timestamp = cutoff_bucket * BUCKET_DURATION;
     ts < cutoff_timestamp
+}
+
+/// `shouldSendNewTcToken` (port de `Utils/tc-token-utils.ts`): o bucket de
+/// 7 dias atual já passou do bucket do timestamp.
+fn should_send_new_tc_token(sender_timestamp: i64) -> bool {
+    const BUCKET_DURATION: i64 = 604800;
+    let now = chrono_now_secs() as i64;
+    now / BUCKET_DURATION > sender_timestamp / BUCKET_DURATION
 }
 
 /// `computeCsToken` (port de `Utils/tc-token-utils.ts`) — HMAC-SHA256 do
