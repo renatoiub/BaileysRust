@@ -451,6 +451,10 @@ pub struct Client {
     wa_version: std::sync::RwLock<[u32; 3]>,
     /// Handle da task de rotação de QR (para cancelar ao parear).
     qr_rotation: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// A rotação esgotou os refs e fechou o socket (`QR refs attempts ended`).
+    qr_refs_ended: Arc<std::sync::atomic::AtomicBool>,
+    /// Acorda o loop de leitura quando os refs de QR acabam.
+    qr_close: Arc<tokio::sync::Notify>,
     /// Cache de envio: `msg_id` → `(destino, Message codificado)` para o
     /// reenvio em `<receipt type="retry">` (port de `sendMessageCache`).
     /// Limitado a `SEND_CACHE_MAX` entradas (FIFO): o retry cai no store Redis
@@ -524,6 +528,8 @@ impl Client {
             open: std::sync::atomic::AtomicBool::new(false),
             wa_version: std::sync::RwLock::new(baileys_core::constants::WA_VERSION),
             qr_rotation: Mutex::new(None),
+            qr_refs_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            qr_close: Arc::new(tokio::sync::Notify::new()),
             send_cache: Mutex::new(HashMap::new()),
             send_cache_order: Mutex::new(Vec::new()),
             force_session_cache: TtlCache::new(Duration::from_secs(600), 2000),
@@ -709,10 +715,17 @@ impl Client {
     /// `ConnectionUpdate { connection: "close", status_code, reason }` — igual
     /// ao `connection.update { connection: 'close', lastDisconnect }` do Node.
     pub async fn run(self: Arc<Self>) -> Result<(), ClientError> {
+        self.qr_refs_ended.store(false, Ordering::SeqCst);
         let result = self.clone().run_inner().await;
-        let (status_code, reason) = match &result {
-            Ok(()) => (Self::WS_CONNECTION_CLOSED, "connectionClosed".to_string()),
-            Err(e) => self.error_to_close(e),
+        self.cancel_qr_rotation().await;
+        let (status_code, reason) = if self.qr_refs_ended.load(Ordering::SeqCst) {
+            // `end(new Boom('QR refs attempts ended', { statusCode: timedOut }))`.
+            (Self::WS_CONNECTION_LOST, "qrRefsEnded".to_string())
+        } else {
+            match &result {
+                Ok(()) => (Self::WS_CONNECTION_CLOSED, "connectionClosed".to_string()),
+                Err(e) => self.error_to_close(e),
+            }
         };
         self.last_close_code.store(status_code, Ordering::SeqCst);
         self.open.store(false, Ordering::SeqCst);
@@ -783,7 +796,16 @@ impl Client {
             }
         });
 
-        while let Some(msg) = stream.next().await {
+        loop {
+            // O fim dos refs de QR fecha o sink; não depende do servidor
+            // responder ao close para sair do loop.
+            let next = tokio::select! {
+                m = stream.next() => m,
+                _ = self.qr_close.notified() => None,
+            };
+            let Some(msg) = next else {
+                break;
+            };
             let msg = msg.map_err(ClientError::WebSocket)?;
             let WsMessage::Binary(data) = msg else {
                 continue;
@@ -1607,6 +1629,9 @@ impl Client {
         let adv_b64_rot = adv_b64.clone();
         let events_rot = self.events.clone();
         let mut qr_interval = self.config.qr_timeout_ms.max(1000);
+        let sink_rot = sink.clone();
+        let refs_ended = self.qr_refs_ended.clone();
+        let qr_close = self.qr_close.clone();
 
         // Cancela qualquer rotação anterior (o Node tem um único `qrTimer`).
         self.cancel_qr_rotation().await;
@@ -1624,6 +1649,13 @@ impl Client {
                 }));
                 qr_interval = 20_000; // refs seguintes: 20s
             }
+            // Refs esgotados: o Node encerra a conexão (408) e o app reconecta
+            // com QR novo.
+            tokio::time::sleep(std::time::Duration::from_millis(qr_interval)).await;
+            tracing::debug!("refs de QR esgotados; encerrando a conexão");
+            refs_ended.store(true, Ordering::SeqCst);
+            let _ = sink_rot.lock().await.close().await;
+            qr_close.notify_waiters();
         });
         *self.qr_rotation.lock().await = Some(handle);
 
