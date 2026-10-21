@@ -2981,7 +2981,12 @@ impl Client {
                 let Some(token) = chat.tc_token.as_deref().filter(|t| !t.is_empty()) else {
                     continue;
                 };
-                let label = chat.lid_jid.as_deref().filter(|l| !l.is_empty()).unwrap_or(&chat.id);
+                let label = chat
+                    .lid_jid
+                    .as_deref()
+                    .filter(|l| !l.is_empty())
+                    .or(chat.id.as_deref())
+                    .unwrap_or_default();
                 self.store_tc_token(
                     label,
                     token,
