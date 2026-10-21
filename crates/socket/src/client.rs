@@ -4574,6 +4574,40 @@ impl Client {
         Ok(meta)
     }
 
+    /// `/groups/flush` do container Node: descarta o cache do grupo e os
+    /// devices dos participantes, busca os metadados de novo e força as
+    /// sessões E2E (`assertSessions(participants.map(p => p.lid || p.id), true)`).
+    ///
+    /// O cache de devices é compartilhado (Redis), então só as entradas dos
+    /// participantes saem — não o `flushAll` inteiro do Node.
+    pub async fn refresh_group(
+        &self,
+        jid: &str,
+        sink: &WsSink,
+    ) -> Result<crate::groups::GroupMetadata, ClientError> {
+        self.group_meta_cache.remove(jid).await;
+        let meta = self.group_metadata(jid, sink).await?;
+
+        for p in &meta.participants {
+            for user in [Some(p.id.as_str()), p.lid.as_deref()].into_iter().flatten() {
+                let normalized = baileys_core::jid_normalized_user(user);
+                if normalized.is_empty() {
+                    continue;
+                }
+                self.devices_cache.remove(&normalized).await;
+                self.devices_cache.remove(&format!("group-{normalized}")).await;
+            }
+        }
+
+        let jids: Vec<String> = meta
+            .participants
+            .iter()
+            .map(|p| p.lid.clone().filter(|l| !l.is_empty()).unwrap_or_else(|| p.id.clone()))
+            .collect();
+        self.assert_sessions(&jids, true, None, sink).await?;
+        Ok(meta)
+    }
+
     /// `groupCreate` — cria um grupo com os participantes.
     pub async fn group_create(
         &self,
@@ -4620,24 +4654,30 @@ impl Client {
         description: Option<&str>,
         sink: &WsSink,
     ) -> Result<(), ClientError> {
-        let query = crate::groups::group_update_description_query(jid, description, None, None)
+        // `prev = metadata.descId` + `id: generateMessageIDV2()` (Hineken).
+        // Metadados frescos: um `descId` antigo do cache faz o servidor recusar.
+        self.group_meta_cache.remove(jid).await;
+        let prev = self.group_metadata(jid, sink).await?.desc_id;
+        let new_id = description.map(|_| baileys_core::ids::generate_message_id_v2(None));
+        let query = crate::groups::group_update_description_query(jid, description, prev.as_deref(), new_id.as_deref())
             .with_attr("id", self.next_tag());
         self.query_node(query, sink).await?;
         Ok(())
     }
 
-    /// `groupParticipantsUpdate` — add/remove/promote/demote.
+    /// `groupParticipantsUpdate` — add/remove/promote/demote. Devolve o
+    /// status por participante (`attrs.error` ou `200`).
     pub async fn group_update_participants(
         &self,
         jid: &str,
         participants: &[String],
         action: &str,
         sink: &WsSink,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Vec<crate::groups::ParticipantUpdateResult>, ClientError> {
         let query = crate::groups::group_participants_update_query(jid, participants, action)
             .with_attr("id", self.next_tag());
-        self.query_node(query, sink).await?;
-        Ok(())
+        let result = self.query_node(query, sink).await?;
+        Ok(crate::groups::extract_participants_update(&result, action))
     }
 
     /// `groupInviteCode`.
@@ -5908,6 +5948,11 @@ impl Client {
     fn next_tag(&self) -> String {
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst);
         format!("{}{}", self.tag_prefix, epoch)
+    }
+
+    /// `generateMessageTag` — id para queries montadas fora da lib.
+    pub fn generate_message_tag(&self) -> String {
+        self.next_tag()
     }
 }
 

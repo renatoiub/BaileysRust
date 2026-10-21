@@ -58,6 +58,39 @@ pub struct GroupParticipant {
     pub admin: Option<String>,
 }
 
+/// Item do retorno de `groupParticipantsUpdate`: `{ status, jid, lid, content }`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ParticipantUpdateResult {
+    pub status: String,
+    pub jid: Option<String>,
+    pub lid: Option<String>,
+    /// Nó `participant` da resposta (`{ tag, attrs }`).
+    pub content: serde_json::Value,
+}
+
+/// `getBinaryNodeChildren(getBinaryNodeChild(result, action), 'participant')`.
+pub fn extract_participants_update(result: &BinaryNode, action: &str) -> Vec<ParticipantUpdateResult> {
+    let Some(node) = result.child(action) else {
+        return Vec::new();
+    };
+    node.children("participant")
+        .into_iter()
+        .map(|p| {
+            let attrs: serde_json::Map<String, serde_json::Value> = p
+                .attrs
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            ParticipantUpdateResult {
+                status: p.attr("error").unwrap_or("200").to_string(),
+                jid: p.attr("jid").map(String::from),
+                lid: p.attr("lid").map(String::from),
+                content: serde_json::json!({ "tag": p.tag, "attrs": attrs }),
+            }
+        })
+        .collect()
+}
+
 /// `extractGroupMetadata` — port fiel do Hineken.
 pub fn extract_group_metadata(result: &BinaryNode) -> Option<GroupMetadata> {
     let group = result.child("group")?;
@@ -197,7 +230,9 @@ pub fn group_update_subject_query(jid: &str, subject: &str) -> BinaryNode {
 pub fn group_update_description_query(jid: &str, description: Option<&str>, prev: Option<&str>, new_id: Option<&str>) -> BinaryNode {
     let mut node = BinaryNode::new("description");
     if let Some(desc) = description {
-        node = node.with_attr("id", new_id.unwrap_or(""));
+        if let Some(id) = new_id {
+            node = node.with_attr("id", id);
+        }
         node = node.with_children(vec![BinaryNode::new("body").with_bytes(desc.as_bytes().to_vec())]);
     } else {
         node = node.with_attr("delete", "true");

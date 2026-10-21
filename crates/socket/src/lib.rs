@@ -18,7 +18,7 @@ pub use client::{
     MessageReceiptUpdate, MessageReaction, MessageStatusUpdate, MessageUpdateData, MessageUpdateKey,
     MessagingHistorySet, PresenceData, RelayParticipant, SendMessageResult, UserReceipt, WsSink,
 };
-pub use groups::{extract_group_metadata, GroupMetadata, GroupParticipant};
+pub use groups::{extract_group_metadata, GroupMetadata, GroupParticipant, ParticipantUpdateResult};
 pub use handshake::{
     configure_successful_pairing, generate_login_node, generate_registration_node, ClientConfig,
     HandshakeError,
