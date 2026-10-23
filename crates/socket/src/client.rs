@@ -5954,6 +5954,21 @@ impl Client {
     pub fn generate_message_tag(&self) -> String {
         self.next_tag()
     }
+
+    /// `rejectCall` do Hineken: rejeita qualquer chamada pelo `callId`/`callFrom`,
+    /// sem depender do estado do gerenciador de chamadas.
+    pub async fn reject_call(&self, call_id: &str, call_from: &str, sink: &WsSink) -> Result<(), ClientError> {
+        let stanza = BinaryNode::new("call")
+            .with_attr("id", self.next_tag())
+            .with_attr("from", self.me_id())
+            .with_attr("to", call_from)
+            .with_children(vec![BinaryNode::new("reject")
+                .with_attr("call-id", call_id)
+                .with_attr("call-creator", call_from)
+                .with_attr("count", "0")]);
+        self.query_node(stanza, sink).await?;
+        Ok(())
+    }
 }
 
 fn to_buffer(bytes: &[u8]) -> baileys_store::creds::BufferValue {

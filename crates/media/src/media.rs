@@ -26,6 +26,8 @@ pub enum MediaType {
     Ptt,
     Gif,
     Ppt,
+    /// `thumbnail-link` — miniatura em alta do link preview.
+    ThumbnailLink,
 }
 
 impl MediaType {
@@ -40,6 +42,7 @@ impl MediaType {
             MediaType::Ptt => "Audio",
             MediaType::Gif => "Video",
             MediaType::Ppt => "Video",
+            MediaType::ThumbnailLink => "Link Thumbnail",
         }
     }
 
@@ -54,6 +57,7 @@ impl MediaType {
             MediaType::Ptt => "/mms/audio",
             MediaType::Gif => "/mms/video",
             MediaType::Ppt => "/mms/video",
+            MediaType::ThumbnailLink => "/mms/image",
         }
     }
 }
