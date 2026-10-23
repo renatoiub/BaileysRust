@@ -10,7 +10,7 @@ use baileys_core::{BinaryContent, BinaryNode};
 use baileys_proto::proto as wa;
 use prost::Message;
 
-use crate::types::{NodeInfo, RelayEndpoint};
+use crate::types::{NodeInfo, RelayData, RelayEndpoint};
 
 /// `generateCallId` — 16 bytes hex maiúsculo.
 pub fn generate_call_id() -> String {
@@ -118,6 +118,170 @@ pub fn extract_relay_endpoints(node: &BinaryNode) -> Vec<RelayEndpoint> {
 
     relays.sort_by_key(|r| r.c2r_rtt.unwrap_or(u32::MAX));
     relays
+}
+
+/// Bytes de um nó (binário ou texto).
+fn node_bytes(node: &BinaryNode) -> Option<Vec<u8>> {
+    match &node.content {
+        Some(BinaryContent::Bytes(b)) => Some(b.clone()),
+        Some(BinaryContent::String(s)) => Some(s.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+fn node_children(node: &BinaryNode) -> &[BinaryNode] {
+    match &node.content {
+        Some(BinaryContent::Children(c)) => c.as_slice(),
+        _ => &[],
+    }
+}
+
+/// `parseRelayFromAck` do `call-manager.ts`: relays, participantes, uuid,
+/// PIDs e `hbh_key` no formato do ack/oferta (`relay` → `token`/`auth_token`
+/// binários por id, `key`, `hbh_key`, `te2` com endereço de 6 bytes).
+pub fn parse_relay_from_ack(ack_node: &BinaryNode) -> RelayData {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let mut data = RelayData::default();
+    let mut participant_seen = std::collections::HashSet::new();
+
+    for child in node_children(ack_node) {
+        if child.tag == "user" {
+            for device in node_children(child) {
+                if device.tag == "device" {
+                    if let Some(jid) = device.attr("jid") {
+                        if participant_seen.insert(jid.to_string()) {
+                            data.participant_jids.push(jid.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if child.tag != "relay" {
+            continue;
+        }
+
+        data.uuid = Some(child.attr("uuid").unwrap_or_default().to_string());
+        if let Some(pid) = child.attr("self_pid").and_then(|v| v.parse().ok()) {
+            data.self_pid = Some(pid);
+        }
+        if let Some(pid) = child.attr("peer_pid").and_then(|v| v.parse().ok()) {
+            data.peer_pid = Some(pid);
+        }
+        let relay_content = node_children(child);
+
+        for rc in relay_content {
+            if rc.tag == "participant" {
+                if let Some(jid) = rc.attr("jid") {
+                    if participant_seen.insert(jid.to_string()) {
+                        data.participant_jids.push(jid.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut relay_key = String::new();
+        let mut tokens: std::collections::HashMap<String, String> = Default::default();
+        let mut auth_tokens: std::collections::HashMap<String, String> = Default::default();
+        let mut raw_tokens: std::collections::HashMap<String, Vec<u8>> = Default::default();
+        let mut raw_auth_tokens: std::collections::HashMap<String, Vec<u8>> = Default::default();
+
+        for rc in relay_content {
+            match rc.tag.as_str() {
+                "key" => {
+                    if let Some(bytes) = node_bytes(rc) {
+                        relay_key = String::from_utf8_lossy(&bytes).to_string();
+                    }
+                }
+                "hbh_key" => {
+                    let raw = match &rc.content {
+                        Some(BinaryContent::Bytes(b)) => Some(b.clone()),
+                        Some(BinaryContent::String(s)) => b64.decode(s).ok(),
+                        _ => None,
+                    };
+                    if let Some(raw) = raw {
+                        if raw.len() == 30 {
+                            data.hbh_key = Some(raw);
+                        } else if raw.len() > 30 {
+                            let as_b64 = String::from_utf8_lossy(&raw).trim().to_string();
+                            if let Ok(decoded) = b64.decode(as_b64) {
+                                if decoded.len() == 30 {
+                                    data.hbh_key = Some(decoded);
+                                }
+                            }
+                        }
+                    }
+                }
+                "token" => {
+                    let id = rc.attr("id").unwrap_or("0").to_string();
+                    match &rc.content {
+                        Some(BinaryContent::Bytes(b)) => {
+                            tokens.insert(id.clone(), b64.encode(b));
+                            raw_tokens.insert(id, b.clone());
+                        }
+                        Some(BinaryContent::String(s)) => {
+                            tokens.insert(id, s.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                "auth_token" => {
+                    let id = rc.attr("id").unwrap_or("0").to_string();
+                    match &rc.content {
+                        Some(BinaryContent::Bytes(b)) => {
+                            auth_tokens.insert(id.clone(), b64.encode(b));
+                            raw_auth_tokens.insert(id, b.clone());
+                        }
+                        Some(BinaryContent::String(s)) => {
+                            auth_tokens.insert(id, s.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for rc in relay_content {
+            if rc.tag != "te2" {
+                continue;
+            }
+            let token_id = rc.attr("token_id").unwrap_or("0").to_string();
+            let auth_token_id = rc.attr("auth_token_id").unwrap_or_default().to_string();
+            let Some(BinaryContent::Bytes(addr)) = &rc.content else {
+                continue;
+            };
+            if addr.len() != 6 {
+                continue;
+            }
+            let ip = format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
+            let port = ((addr[4] as u16) << 8) | addr[5] as u16;
+            data.endpoints.push(RelayEndpoint {
+                ip,
+                port,
+                token: tokens.get(&token_id).cloned().unwrap_or_default(),
+                auth_token: (!auth_token_id.is_empty())
+                    .then(|| auth_tokens.get(&auth_token_id).cloned())
+                    .flatten(),
+                raw_auth_token: (!auth_token_id.is_empty())
+                    .then(|| raw_auth_tokens.get(&auth_token_id).cloned())
+                    .flatten(),
+                raw_token: raw_tokens.get(&token_id).cloned(),
+                key: relay_key.clone(),
+                relay_id: rc.attr("relay_id").and_then(|v| v.parse().ok()).unwrap_or(0),
+                protocol: Some(rc.attr("protocol").and_then(|v| v.parse().ok()).unwrap_or(0)),
+                c2r_rtt: rc.attr("c2r_rtt").and_then(|v| v.parse().ok()),
+                relay_name: Some(rc.attr("relay_name").unwrap_or_default().to_string()),
+                address_bytes: Some(addr.clone()),
+                auth_token_id: Some(if auth_token_id.is_empty() { token_id.clone() } else { auth_token_id.clone() }),
+            });
+        }
+    }
+
+    data.endpoints.sort_by_key(|r| r.c2r_rtt.unwrap_or(u32::MAX));
+    data
 }
 
 /// `ensureDeviceJid` — bare user JID → `user:0@…`.
@@ -469,150 +633,146 @@ pub fn encode_call_message(call_key: &[u8]) -> Vec<u8> {
     baileys_core::ids::write_random_pad_max16(&bytes)
 }
 
-/// `decryptCallKeyInNode` — descriptografa um `<enc>` e substitui o conteúdo
-/// pelo callKey puro (32 bytes), retornando o nó clonado e o callKey.
+/// `decryptCallKeyInNode` — tenta cada `<enc>` (raiz e `destination/to`),
+/// preferindo o `to` endereçado a um dos `our_device_jids`; o primeiro que
+/// descriptografar vira `<enc v=2>callKey</enc>` no nó clonado.
+///
+/// `decrypt` recebe `(jid, type, ciphertext)` e devolve o plaintext com padding.
 pub fn decrypt_call_key_in_node(
     decrypt: &dyn Fn(&str, &str, &[u8]) -> Result<Vec<u8>, String>,
     node: &BinaryNode,
     peer_jid: &str,
+    our_device_jids: &[String],
 ) -> Result<(BinaryNode, Vec<u8>), String> {
-    let mut cloned = node.clone();
+    #[derive(Clone, Copy)]
+    enum Path {
+        Root(usize),
+        Dest(usize, usize, usize),
+    }
 
-    // Coleciona candidatos (enc, parent-index).
-    let mut candidates: Vec<(usize, usize)> = Vec::new();
-    // (child_idx, parent_idx) — parent é o índice do `to` dentro do destination.
+    let mut cloned = node.clone();
     let Some(BinaryContent::Children(children)) = &cloned.content else {
         return Err("no content".to_string());
     };
 
+    let mut candidates: Vec<(Path, Option<String>)> = Vec::new();
     for (i, child) in children.iter().enumerate() {
         if child.tag == "enc" && child.attr("type").is_some() {
-            candidates.push((i, usize::MAX));
+            candidates.push((Path::Root(i), None));
         }
     }
-
-    let mut destination_idx = None;
-    if let Some(pos) = children.iter().position(|c| c.tag == "destination") {
-        destination_idx = Some(pos);
-    }
-
-    if let Some(dest_idx) = destination_idx {
-        let mut to_candidates: Vec<(usize, usize)> = Vec::new();
-        if let Some(BinaryContent::Children(to_nodes)) = &children[dest_idx].content {
-            for (ti, to_node) in to_nodes.iter().enumerate() {
-                if let Some(BinaryContent::Children(enc_nodes)) = &to_node.content {
-                    for (ei, enc) in enc_nodes.iter().enumerate() {
-                        if enc.tag == "enc" && enc.attr("type").is_some() {
-                            to_candidates.push((ei, ti));
-                        }
-                    }
+    if let Some(dest_idx) = children.iter().position(|c| c.tag == "destination") {
+        for (ti, to_node) in node_children(&children[dest_idx]).iter().enumerate() {
+            if to_node.tag != "to" {
+                continue;
+            }
+            let to_jid = to_node.attr("jid").map(String::from);
+            for (ei, enc) in node_children(to_node).iter().enumerate() {
+                if enc.tag == "enc" && enc.attr("type").is_some() {
+                    candidates.push((Path::Dest(dest_idx, ti, ei), to_jid.clone()));
                 }
             }
         }
-        // Preferir `to` do nosso device — aqui tentamos na ordem inversa
-        // (o último é geralmente o destinado ao device atual).
-        to_candidates.reverse();
-        candidates = to_candidates
-            .into_iter()
-            .chain(candidates)
-            .collect();
     }
+    if candidates.is_empty() {
+        return Err("no enc candidates".to_string());
+    }
+
+    let mut ours: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for jid in our_device_jids.iter().filter(|j| !j.is_empty()) {
+        ours.insert(ensure_device_jid(jid));
+        ours.insert(jid_base(jid));
+    }
+    let rank = |to: &Option<String>| -> u8 {
+        match to {
+            Some(j) if ours.contains(j) || ours.contains(&ensure_device_jid(j)) || ours.contains(&jid_base(j)) => 0,
+            Some(_) => 1,
+            None => 2,
+        }
+    };
+    candidates.sort_by_key(|(_, to)| rank(to));
+
+    let enc_at = |root: &BinaryNode, path: Path| -> Option<BinaryNode> {
+        let children = node_children(root);
+        match path {
+            Path::Root(i) => children.get(i).cloned(),
+            Path::Dest(d, t, e) => node_children(children.get(d)?)
+                .get(t)
+                .and_then(|to| node_children(to).get(e).cloned()),
+        }
+    };
 
     let mut last_err = String::from("no candidates");
-    for (child_idx, parent_idx) in candidates {
-        let enc_content: Vec<u8> = {
-            let children = match &cloned.content {
-                Some(BinaryContent::Children(c)) => c,
-                _ => return Err("no content".to_string()),
-            };
-            if parent_idx == usize::MAX {
-                match &children[child_idx].content {
-                    Some(BinaryContent::Bytes(b)) => b.clone(),
-                    _ => continue,
-                }
-            } else {
-                let dest_idx = destination_idx.unwrap();
-                match &children[dest_idx].content {
-                    Some(BinaryContent::Children(to_nodes)) => {
-                        match &to_nodes[parent_idx].content {
-                            Some(BinaryContent::Children(enc_nodes)) => {
-                                match &enc_nodes[child_idx].content {
-                                    Some(BinaryContent::Bytes(b)) => b.clone(),
-                                    _ => continue,
+    let total = candidates.len();
+    for (path, to_jid) in candidates {
+        let Some(enc) = enc_at(&cloned, path) else {
+            continue;
+        };
+        let Some(BinaryContent::Bytes(ciphertext)) = &enc.content else {
+            continue;
+        };
+        let enc_type = enc.attr("type").unwrap_or("msg").to_string();
+
+        let attempt = decrypt(peer_jid, &enc_type, ciphertext).and_then(|decrypted| {
+            let unpadded = unpad_random_max16(&decrypted).map_err(|e| e.to_string())?;
+            let message = wa::Message::decode(unpadded.as_slice()).map_err(|e| e.to_string())?;
+            let call_key = message.call.and_then(|c| c.call_key).unwrap_or_default();
+            if call_key.len() != 32 {
+                return Err(format!("invalid callKey: expected 32 bytes, got {}", call_key.len()));
+            }
+            Ok(call_key)
+        });
+
+        match attempt {
+            Ok(call_key) => {
+                let replacement = BinaryNode::new("enc").with_attr("v", "2").with_bytes(call_key.clone());
+                if let Some(BinaryContent::Children(children)) = &mut cloned.content {
+                    match path {
+                        Path::Root(i) => children[i] = replacement,
+                        Path::Dest(d, t, e) => {
+                            if let Some(BinaryContent::Children(tos)) = &mut children[d].content {
+                                if let Some(BinaryContent::Children(encs)) = &mut tos[t].content {
+                                    encs[e] = replacement;
                                 }
                             }
-                            _ => continue,
-                        }
-                    }
-                    _ => continue,
-                }
-            }
-        };
-
-        let enc_type = {
-            let children = match &cloned.content {
-                Some(BinaryContent::Children(c)) => c,
-                _ => return Err("no content".to_string()),
-            };
-            if parent_idx == usize::MAX {
-                children[child_idx].attr("type").unwrap_or("msg").to_string()
-            } else {
-                let dest_idx = destination_idx.unwrap();
-                match &children[dest_idx].content {
-                    Some(BinaryContent::Children(to_nodes)) => match &to_nodes[parent_idx].content {
-                        Some(BinaryContent::Children(enc_nodes)) => {
-                            enc_nodes[child_idx].attr("type").unwrap_or("msg").to_string()
-                        }
-                        _ => "msg".to_string(),
-                    },
-                    _ => "msg".to_string(),
-                }
-            }
-        };
-
-        match decrypt(peer_jid, &enc_type, &enc_content) {
-            Ok(decrypted) => {
-                let unpadded = unpad_random_max16(&decrypted).map_err(|e| e.to_string())?;
-                let message = wa::Message::decode(unpadded.as_slice())
-                    .map_err(|e| e.to_string())?;
-                let call_key = message
-                    .call
-                    .and_then(|c| c.call_key)
-                    .ok_or_else(|| "no call key".to_string())?;
-                if call_key.len() != 32 {
-                    return Err(format!(
-                        "invalid callKey: expected 32 bytes, got {}",
-                        call_key.len()
-                    ));
-                }
-
-                // Substitui o conteúdo do enc pelo callKey puro.
-                let children = match &mut cloned.content {
-                    Some(BinaryContent::Children(c)) => c,
-                    _ => return Err("no content".to_string()),
-                };
-                if parent_idx == usize::MAX {
-                    children[child_idx] = BinaryNode::new("enc")
-                        .with_attr("v", "2")
-                        .with_bytes(call_key.clone());
-                } else {
-                    let dest_idx = destination_idx.unwrap();
-                    if let Some(BinaryContent::Children(to_nodes)) = &mut children[dest_idx].content {
-                        if let Some(BinaryContent::Children(enc_nodes)) = &mut to_nodes[parent_idx].content {
-                            enc_nodes[child_idx] = BinaryNode::new("enc")
-                                .with_attr("v", "2")
-                                .with_bytes(call_key.clone());
                         }
                     }
                 }
-
+                tracing::info!(
+                    "[Signaling] callKey decrypt OK peer={peer_jid} to={}",
+                    to_jid.as_deref().unwrap_or("root-enc")
+                );
                 return Ok((cloned, call_key));
             }
             Err(e) => last_err = e,
         }
     }
 
+    tracing::error!("[Signaling] decrypt error (tried {total} enc): {last_err}");
     Err(last_err)
+}
+
+/// Transport pós-accept (`transport-message-type=1`, `p2p-cand-round=1`),
+/// endereçado ao device que atendeu.
+pub fn build_post_accept_transport_stanza(
+    to_jid: &str,
+    call_id: &str,
+    call_creator: &str,
+    me_id: Option<&str>,
+) -> BinaryNode {
+    BinaryNode::new("call")
+        .with_attr("to", to_jid)
+        .with_attr("id", generate_message_id_v2(me_id))
+        .with_children(vec![
+            BinaryNode::new("transport")
+                .with_attr("call-id", call_id)
+                .with_attr("call-creator", call_creator)
+                .with_attr("transport-message-type", "1")
+                .with_attr("p2p-cand-round", "1")
+                .with_children(vec![
+                    BinaryNode::new("net").with_attr("medium", "2").with_attr("protocol", "0"),
+                ]),
+        ])
 }
 
 #[cfg(test)]
@@ -705,9 +865,75 @@ mod tests {
             &|_jid, _type, data| Ok(data.to_vec()),
             &node,
             "peer",
+            &[],
         )
         .unwrap();
         assert_eq!(result.1, call_key);
         assert_eq!(result.1.len(), 32);
+    }
+
+    #[test]
+    fn decrypt_prefers_enc_addressed_to_our_device() {
+        let call_key = vec![0x11u8; 32];
+        let good = encode_call_message(&call_key);
+        let node = BinaryNode::new("accept").with_children(vec![BinaryNode::new("destination")
+            .with_children(vec![
+                BinaryNode::new("to").with_attr("jid", "other:3@lid").with_children(vec![
+                    BinaryNode::new("enc").with_attr("type", "msg").with_bytes(vec![0xFF; 8]),
+                ]),
+                BinaryNode::new("to").with_attr("jid", "me:7@lid").with_children(vec![
+                    BinaryNode::new("enc").with_attr("type", "msg").with_bytes(good),
+                ]),
+            ])]);
+        let tried = std::cell::RefCell::new(Vec::new());
+        let result = decrypt_call_key_in_node(
+            &|_jid, _type, data| {
+                tried.borrow_mut().push(data.len());
+                Ok(data.to_vec())
+            },
+            &node,
+            "peer",
+            &["me:7@lid".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.1, call_key);
+        assert_eq!(tried.borrow().len(), 1);
+    }
+
+    #[test]
+    fn parse_relay_from_ack_reads_te2_tokens_and_participants() {
+        let node = BinaryNode::new("ack").with_children(vec![
+            BinaryNode::new("user").with_children(vec![
+                BinaryNode::new("device").with_attr("jid", "peer:5@lid"),
+            ]),
+            BinaryNode::new("relay")
+                .with_attr("uuid", "U")
+                .with_attr("self_pid", "1")
+                .with_attr("peer_pid", "2")
+                .with_children(vec![
+                    BinaryNode::new("participant").with_attr("jid", "me:7@lid"),
+                    BinaryNode::new("key").with_bytes(b"relaykey".to_vec()),
+                    BinaryNode::new("token").with_attr("id", "0").with_bytes(vec![1, 2, 3]),
+                    BinaryNode::new("auth_token").with_attr("id", "0").with_bytes(vec![4, 5]),
+                    BinaryNode::new("te2")
+                        .with_attr("relay_name", "gru1")
+                        .with_attr("token_id", "0")
+                        .with_attr("auth_token_id", "0")
+                        .with_attr("c2r_rtt", "30")
+                        .with_bytes(vec![10, 0, 0, 1, 0x0D, 0x96]),
+                ]),
+        ]);
+        let data = parse_relay_from_ack(&node);
+        assert_eq!(data.participant_jids, vec!["peer:5@lid", "me:7@lid"]);
+        assert_eq!(data.self_pid, Some(1));
+        assert_eq!(data.peer_pid, Some(2));
+        assert_eq!(data.endpoints.len(), 1);
+        let ep = &data.endpoints[0];
+        assert_eq!(ep.ip, "10.0.0.1");
+        assert_eq!(ep.port, 3478);
+        assert_eq!(ep.key, "relaykey");
+        assert_eq!(ep.raw_token.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(ep.raw_auth_token.as_deref(), Some(&[4u8, 5][..]));
+        assert_eq!(ep.relay_name.as_deref(), Some("gru1"));
     }
 }

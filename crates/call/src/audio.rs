@@ -1,7 +1,7 @@
 //! AudioEngine — captura/playback de áudio PCM (port de `services/call/audio-engine.ts`).
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::types::AudioEngineConfig;
 
@@ -63,8 +63,14 @@ impl AudioEngine {
         &self.config
     }
 
+    /// Lock síncrono: chamado de dentro do runtime tokio (o `blocking_lock`
+    /// do tokio entra em pânico ali).
+    fn st(&self) -> MutexGuard<'_, EngineState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn set_external_mode(&self, enabled: bool) {
-        let mut s = self.state.blocking_lock();
+        let mut s = self.st();
         s.external_mode = enabled;
         s.ext_started = false;
         s.ext_skip_count = 0;
@@ -82,11 +88,11 @@ impl AudioEngine {
     }
 
     pub fn is_external_mode(&self) -> bool {
-        self.state.blocking_lock().external_mode
+        self.st().external_mode
     }
 
     pub fn feed_external_audio(&self, data: &[f32]) {
-        let mut s = self.state.blocking_lock();
+        let mut s = self.st();
         if s.audio_buffer.is_none() {
             return;
         }
@@ -118,19 +124,19 @@ impl AudioEngine {
     }
 
     pub fn is_audio_finished(&self) -> bool {
-        self.state.blocking_lock().audio_finished
+        self.st().audio_finished
     }
 
     /// Carrega PCM f32 (já decodificado pelo chamador via FFmpeg).
     pub fn load_audio(&self, samples: Vec<f32>) {
-        let mut s = self.state.blocking_lock();
+        let mut s = self.st();
         s.audio_buffer = Some(samples);
         s.audio_position = 0;
         s.audio_finished = false;
     }
 
     pub fn has_audio(&self) -> bool {
-        let s = self.state.blocking_lock();
+        let s = self.st();
         matches!(&s.audio_buffer, Some(b) if !b.is_empty())
     }
 
@@ -142,23 +148,43 @@ impl AudioEngine {
             let t = i as f32 / sr;
             buffer.push((std::f32::consts::TAU * frequency * t).sin() * amplitude);
         }
-        let mut s = self.state.blocking_lock();
+        let mut s = self.st();
         s.audio_buffer = Some(buffer);
         s.audio_position = 0;
         s.audio_finished = false;
     }
 
     pub fn set_silence_mode(&self, enabled: bool) {
-        self.state.blocking_lock().silence_mode = enabled;
+        self.st().silence_mode = enabled;
     }
 
     pub fn is_silence_mode(&self) -> bool {
-        self.state.blocking_lock().silence_mode
+        self.st().silence_mode
+    }
+
+    /// Início da captura real (`startCapture`): sai do warmup de silêncio e,
+    /// no modo ao vivo, pula o áudio acumulado durante o toque mantendo só o
+    /// pré-buffer do jitter.
+    pub fn begin_capture(&self) {
+        let mut s = self.st();
+        s.silence_mode = false;
+        if s.external_mode {
+            s.audio_position = s.live_write_pos.saturating_sub(s.ext_pre_buffer_size);
+            let available = s.live_write_pos - s.audio_position;
+            s.ext_started = available >= s.ext_pre_buffer_size;
+        } else {
+            s.audio_position = 0;
+        }
+    }
+
+    /// Chunk de silêncio do warmup pré-accept (`startSilenceCapture`).
+    pub fn silence_chunk(&self) -> Vec<f32> {
+        vec![0.0; self.config.capture_chunk_size]
     }
 
     /// Escreve dados de playback no buffer circular.
     pub fn on_playback_data(&self, audio_data: &[f32]) {
-        let mut s = self.state.blocking_lock();
+        let mut s = self.st();
         let max = self.config.max_buffer_size;
         for &sample in audio_data {
             if s.buffer_len >= max {
@@ -173,7 +199,7 @@ impl AudioEngine {
 
     /// Lê do buffer circular para reprodução.
     pub fn read_playback(&self, count: usize) -> Vec<f32> {
-        let mut s = self.state.blocking_lock();
+        let mut s = self.st();
         let max = self.config.max_buffer_size;
         let mut out = vec![0.0; count];
         for slot in out.iter_mut() {
@@ -193,7 +219,7 @@ impl AudioEngine {
         let silence = vec![0.0; chunk_size];
 
         // Resolve o range de leitura (mutando posições) sem segurar ref do slice.
-        let mut s = self.state.blocking_lock();
+        let mut s = self.st();
 
         let has_buffer = s.audio_buffer.is_some();
         if !has_buffer {
@@ -256,14 +282,14 @@ impl AudioEngine {
     }
 
     pub fn reset_playback_buffer(&self) {
-        let mut s = self.state.blocking_lock();
+        let mut s = self.st();
         s.buffer_write_pos = 0;
         s.buffer_read_pos = 0;
         s.buffer_len = 0;
     }
 
     pub fn stats(&self) -> (u64, usize) {
-        let s = self.state.blocking_lock();
+        let s = self.st();
         (s.ext_skip_count, s.buffer_len)
     }
 }

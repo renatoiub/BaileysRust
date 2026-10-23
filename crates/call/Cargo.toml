@@ -28,6 +28,7 @@ hkdf.workspace = true
 libloading = "0.9"
 futures-util.workspace = true
 cpal = "0.15"
+webrtc = "0.17"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

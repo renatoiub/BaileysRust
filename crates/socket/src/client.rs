@@ -239,19 +239,73 @@ pub struct MessagingHistorySet {
     pub sync_type: i32,
 }
 
-/// Chamada (espelha `call` do Baileys).
+/// Chamada (espelha `WACallEvent` do Baileys; serializa igual ao JSON do Node).
 #[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CallInfo {
     pub chat_id: String,
     pub from: String,
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_pn: Option<String>,
+    /// Segundos (`attrs.t`); serializa como `new Date(t * 1000)`.
+    #[serde(serialize_with = "serialize_call_date")]
     pub date: Option<i64>,
     pub offline: bool,
     pub status: String,
     pub is_video: bool,
     pub is_group: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group_jid: Option<String>,
+}
+
+fn serialize_call_date<S: serde::Serializer>(date: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+    match date {
+        Some(secs) => s.serialize_str(&iso_utc_from_secs(*secs)),
+        None => s.serialize_none(),
+    }
+}
+
+/// `Date.toISOString()` para um timestamp em segundos.
+fn iso_utc_from_secs(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // civil_from_days (H. Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Dados da oferta guardados no `callOfferCache` do `handleCall`.
+#[derive(Debug, Clone, Default)]
+struct CallOfferData {
+    is_video: bool,
+    is_group: bool,
+    caller_pn: Option<String>,
+}
+
+/// `getCallStatusFromNode` do Hineken.
+fn call_status_from_node(node: &BinaryNode) -> &'static str {
+    match node.tag.as_str() {
+        "offer" | "offer_notice" => "offer",
+        "terminate" if node.attr("reason") == Some("timeout") => "timeout",
+        "terminate" => "terminate",
+        "reject" => "reject",
+        "accept" => "accept",
+        _ => "ringing",
+    }
 }
 
 /// `NO_MESSAGE_FOUND_ERROR_TEXT` do Hineken.
@@ -458,6 +512,8 @@ pub struct Client {
     last_close_code: AtomicI32,
     /// `true` entre o `connection: "open"` e o `connection: "close"`.
     open: std::sync::atomic::AtomicBool,
+    /// `callOfferCache` do `handleCall` (dados da oferta por `call-id`).
+    call_offer_cache: std::sync::Mutex<HashMap<String, CallOfferData>>,
     /// Versão do WhatsApp Web do handshake (`version` do `makeWASocket`);
     /// vale a partir da próxima conexão.
     wa_version: std::sync::RwLock<[u32; 3]>,
@@ -530,6 +586,7 @@ impl Client {
             noise: Mutex::new(None),
             last_close_code: AtomicI32::new(0),
             open: std::sync::atomic::AtomicBool::new(false),
+            call_offer_cache: std::sync::Mutex::new(HashMap::new()),
             wa_version: std::sync::RwLock::new(baileys_core::constants::WA_VERSION),
             qr_rotation: Mutex::new(None),
             qr_refs_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -687,6 +744,57 @@ impl Client {
     pub fn decrypt_for(&self, jid: &str, enc_type: &str, data: &[u8]) -> Result<Vec<u8>, ClientError> {
         let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
         Ok(repo.decrypt_message(jid, enc_type, data)?)
+    }
+
+    /// `createParticipantNodes(jids, message, extraAttrs, lid)` do Hineken:
+    /// `patchMessageBeforeSending`, `encodeWAMessage` (com padding) e um
+    /// `<to jid><enc v=2 type ...extraAttrs>` por device, cifrado para o
+    /// `convertlidDevice(jid, lid)`.
+    pub fn create_participant_nodes(
+        &self,
+        jids: &[String],
+        message: &wa::Message,
+        extra_attrs: &[(&str, &str)],
+        lid: Option<&str>,
+    ) -> Result<(Vec<BinaryNode>, bool), ClientError> {
+        let patched = self.patch_message(message);
+        let bytes = write_random_pad_max16(&patched.encode_to_vec());
+        let me_id = self.me_id();
+        let me_lid = if self.me_lid().is_empty() { me_id.clone() } else { self.me_lid() };
+        let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
+
+        let mut include_device_identity = false;
+        let mut nodes = Vec::with_capacity(jids.len());
+        for jid in jids {
+            let dest = convert_lid_device(jid, lid, &me_id, &me_lid);
+            let enc = repo.encrypt_message(&dest, &bytes)?;
+            if enc.r#type == "pkmsg" {
+                include_device_identity = true;
+            }
+            let mut enc_node = BinaryNode::new("enc").with_attr("v", "2").with_attr("type", &enc.r#type);
+            for &(k, v) in extra_attrs {
+                enc_node = enc_node.with_attr(k, v);
+            }
+            nodes.push(
+                BinaryNode::new("to")
+                    .with_attr("jid", jid)
+                    .with_children(vec![enc_node.with_bytes(enc.ciphertext)]),
+            );
+        }
+        Ok((nodes, include_device_identity))
+    }
+
+    /// `encodeSignedDeviceIdentity(creds.account, true)`.
+    pub fn signed_device_identity(&self) -> Option<Vec<u8>> {
+        let account = self.store.creds().account?;
+        crate::handshake::encode_signed_device_identity(&account, true)
+    }
+
+    /// `authState.keys.get('contacts-tc-token', [jid])[jid].token`.
+    pub fn tc_token_for(&self, jid: &str) -> Option<Vec<u8>> {
+        let raw = self.store.load_generic("contacts-tc-token", jid)?;
+        let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+        buffer_value_bytes(value.get("token")?).filter(|t| !t.is_empty())
     }
 
     /// Conecta e processa o fluxo até o socket fechar (retorna o erro ou `Ok`).
@@ -1045,17 +1153,13 @@ impl Client {
             return Err(ClientError::ConnectionClosed);
         }
 
-        // Call offer (tag `call`, filho `offer`) — sem ack, o servidor
-        // derruba a conexão com `stream:error 500` carregando
-        // `<ack class="call" type="offer" ...>`.
-        if tag == "call" && l2 == "offer" {
-            let ack = BinaryNode::new("ack")
-                .with_attr("id", node.attr("id").unwrap_or_default())
-                .with_attr("to", node.attr("from").unwrap_or_default())
-                .with_attr("class", "call")
-                .with_attr("type", "offer");
-            self.send_node(&ack, sink).await?;
-            tracing::debug!(from = ?node.attr("from"), "call offer acked");
+        // `CB:ack,class:call` — resposta do servidor à nossa oferta (traz os
+        // relays). O container Node repassa o nó cru ao call manager.
+        if tag == "ack" && node.attr("class") == Some("call") {
+            let _ = self.events.send(ClientEvent::Call {
+                calls: Vec::new(),
+                raw_nodes: vec![node.clone()],
+            });
             return Ok(());
         }
 
@@ -1169,10 +1273,10 @@ impl Client {
             return Ok(());
         }
 
-        // Call (`call` com `<offer>`) — além do ack acima, emite o evento
-        // `ClientEvent::Call` para o webhook e o call-player.
+        // `CB:call` → `handleCall`: evento + ack de todo nó de chamada (sem
+        // ack o servidor derruba a conexão com `stream:error 500`).
         if tag == "call" {
-            self.handle_call_node(node);
+            self.handle_call_node(node, sink).await?;
             return Ok(());
         }
 
@@ -1287,31 +1391,102 @@ impl Client {
         }
     }
 
-    /// Port de `call` (evento `call` do Baileys) — emite `CallInfo`.
-    fn handle_call_node(&self, node: &BinaryNode) {
-        let from = node.attr("from").unwrap_or_default().to_string();
-        let id = node.attr("id").unwrap_or_default().to_string();
-        let status = node.attr("type").unwrap_or("offer").to_string();
-        let call_type = node.attr("call_type").unwrap_or_default().to_string();
-        let is_video = call_type == "video";
-        let is_group = baileys_core::is_jid_group(&from);
-
-        let call = CallInfo {
-            chat_id: from.clone(),
-            from: from.clone(),
-            id,
-            caller_pn: node.attr("caller_pn").map(String::from),
-            date: node.attr("t").and_then(|t| t.parse::<i64>().ok()),
-            offline: node.attr("offline").and_then(|v| v.parse::<bool>().ok()).unwrap_or(false),
-            status,
-            is_video,
-            is_group,
-            group_jid: if is_group { Some(from) } else { None },
+    /// `handleCall` do Hineken: o evento `call` sai do primeiro filho
+    /// (`offer`/`accept`/`terminate`...), com os dados da oferta guardados no
+    /// `callOfferCache`; depois o `sendMessageAck` do nó.
+    async fn handle_call_node(&self, node: &BinaryNode, sink: &WsSink) -> Result<(), ClientError> {
+        let info_child = match &node.content {
+            Some(BinaryContent::Children(children)) => children.first().cloned(),
+            _ => None,
         };
-        let _ = self.events.send(ClientEvent::Call {
-            calls: vec![call],
-            raw_nodes: vec![node.clone()],
-        });
+        if let Some(info) = info_child {
+            let call_id = info.attr("call-id").unwrap_or_default().to_string();
+            let from = info
+                .attr("from")
+                .or_else(|| info.attr("call-creator"))
+                .unwrap_or_default()
+                .to_string();
+            let mut status = call_status_from_node(&info).to_string();
+            if baileys_core::is_lid_user(&from) && info.tag == "relaylatency" && !self.call_offer_seen(&call_id) {
+                status = "offer".to_string();
+                self.call_offer_remember(&call_id, CallOfferData::default());
+            }
+
+            let mut call = CallInfo {
+                chat_id: node.attr("from").unwrap_or_default().to_string(),
+                from: from.clone(),
+                id: call_id.clone(),
+                caller_pn: info.attr("caller_pn").map(String::from),
+                date: node.attr("t").and_then(|t| t.parse::<i64>().ok()),
+                offline: node.attr("offline").is_some(),
+                status: status.clone(),
+                is_video: false,
+                is_group: false,
+                group_jid: None,
+            };
+            if status == "offer" {
+                call.is_video = info.child("video").is_some();
+                call.group_jid = info.attr("group-jid").map(String::from);
+                call.is_group = info.attr("type") == Some("group") || call.group_jid.is_some();
+                self.call_offer_remember(
+                    &call_id,
+                    CallOfferData {
+                        is_video: call.is_video,
+                        is_group: call.is_group,
+                        caller_pn: call.caller_pn.clone(),
+                    },
+                );
+            }
+            if let Some(existing) = self.call_offer_get(&call_id) {
+                call.is_video = existing.is_video;
+                call.is_group = existing.is_group;
+                if call.caller_pn.is_none() {
+                    call.caller_pn = existing.caller_pn;
+                }
+            }
+            if matches!(status.as_str(), "reject" | "accept" | "timeout" | "terminate") {
+                self.call_offer_forget(&call_id);
+            }
+
+            let _ = self.events.send(ClientEvent::Call {
+                calls: vec![call],
+                raw_nodes: vec![node.clone()],
+            });
+        }
+
+        // `sendMessageAck`: `class` = tag, `type` só se o nó tiver.
+        let mut ack = BinaryNode::new("ack")
+            .with_attr("id", node.attr("id").unwrap_or_default())
+            .with_attr("to", node.attr("from").unwrap_or_default())
+            .with_attr("class", "call");
+        for attr in ["participant", "recipient", "type"] {
+            if let Some(v) = node.attr(attr) {
+                ack = ack.with_attr(attr, v);
+            }
+        }
+        self.send_node(&ack, sink).await
+    }
+
+    fn call_offer_seen(&self, call_id: &str) -> bool {
+        self.call_offer_cache.lock().unwrap_or_else(|e| e.into_inner()).contains_key(call_id)
+    }
+
+    fn call_offer_get(&self, call_id: &str) -> Option<CallOfferData> {
+        self.call_offer_cache.lock().unwrap_or_else(|e| e.into_inner()).get(call_id).cloned()
+    }
+
+    fn call_offer_remember(&self, call_id: &str, data: CallOfferData) {
+        let mut cache = self.call_offer_cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Limite simples: o Node usa NodeCache com TTL; aqui as entradas saem
+        // no fim da chamada e o mapa nunca cresce sem limite.
+        if cache.len() >= 500 {
+            cache.clear();
+        }
+        cache.insert(call_id.to_string(), data);
+    }
+
+    fn call_offer_forget(&self, call_id: &str) {
+        self.call_offer_cache.lock().unwrap_or_else(|e| e.into_inner()).remove(call_id);
     }
 
     /// Port de `groups.upsert`/`groups.update`/`group-participants.update`

@@ -40,10 +40,8 @@ pub enum MlowError {
     Decode(String),
 }
 
-// Assinaturas da libopus_mlow. As `*_ctl` são variadic em C, mas quando
-// chamadas com um único argumento `int`, a ABI (SysV/Windows x64/ARM64)
-// passa o valor no mesmo registrador de um argumento fixo — declaramos como
-// `(st, request, val)`.
+// Assinaturas da libopus_mlow. As `*_ctl` são variádicas em C e precisam ser
+// declaradas assim: no ARM64 da Apple os argumentos variádicos vão na pilha.
 #[allow(non_snake_case)]
 struct MlowApi {
     global_create: libloading::Symbol<'static, unsafe extern "C" fn()>,
@@ -52,7 +50,7 @@ struct MlowApi {
         unsafe extern "C" fn(i32, c_int, *mut u8) -> *mut c_void,
     >,
     decoder_ctl:
-        libloading::Symbol<'static, unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int>,
+        libloading::Symbol<'static, unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int>,
     decode: libloading::Symbol<
         'static,
         unsafe extern "C" fn(*mut c_void, *const u8, i32, *mut i16, c_int, c_int) -> c_int,
@@ -63,7 +61,7 @@ struct MlowApi {
         unsafe extern "C" fn(i32, c_int, c_int, *mut u8) -> *mut c_void,
     >,
     encoder_ctl:
-        libloading::Symbol<'static, unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int>,
+        libloading::Symbol<'static, unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int>,
     encode: libloading::Symbol<
         'static,
         unsafe extern "C" fn(*mut c_void, *const i16, c_int, *mut u8, i32) -> c_int,
@@ -154,7 +152,7 @@ fn load_api() -> Result<&'static MlowApi, MlowError> {
             ),
             decoder_ctl: sym!(
                 "opus_decoder_ctl",
-                unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int
+                unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int
             ),
             decode: sym!(
                 "opus_decode",
@@ -170,7 +168,7 @@ fn load_api() -> Result<&'static MlowApi, MlowError> {
             ),
             encoder_ctl: sym!(
                 "opus_encoder_ctl",
-                unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int
+                unsafe extern "C" fn(*mut c_void, c_int, ...) -> c_int
             ),
             encode: sym!(
                 "opus_encode",
