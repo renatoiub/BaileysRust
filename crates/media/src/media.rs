@@ -239,6 +239,47 @@ pub fn image_thumbnail(buffer: &[u8], width: u32) -> Result<Thumbnail, MediaErro
     })
 }
 
+/// `loadImageBuffer` do container Node (`sharp(buf).rotate()`, webp → png):
+/// aplica a orientação EXIF e devolve o mimetype do formato real. Sem
+/// rotação e fora de webp, os bytes originais voltam como estão.
+pub fn normalize_image(buffer: &[u8], fallback_mime: &str) -> (Vec<u8>, String) {
+    use image::ImageDecoder;
+
+    let original = || (buffer.to_vec(), fallback_mime.to_string());
+    let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(buffer)).with_guessed_format() else {
+        return original();
+    };
+    let Some(format) = reader.format() else {
+        return original();
+    };
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return original();
+    };
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let is_webp = format == image::ImageFormat::WebP;
+    let mime = match format {
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Png | image::ImageFormat::WebP => "image/png",
+        image::ImageFormat::Gif => "image/gif",
+        _ => fallback_mime,
+    }
+    .to_string();
+
+    if orientation == image::metadata::Orientation::NoTransforms && !is_webp {
+        return (buffer.to_vec(), mime);
+    }
+    let Ok(mut img) = image::DynamicImage::from_decoder(decoder) else {
+        return original();
+    };
+    img.apply_orientation(orientation);
+    let out_format = if is_webp { image::ImageFormat::Png } else { format };
+    let mut out = std::io::Cursor::new(Vec::new());
+    match img.write_to(&mut out, out_format) {
+        Ok(()) => (out.into_inner(), mime),
+        Err(_) => original(),
+    }
+}
+
 /// Dimensões de imagem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageDimensions {
