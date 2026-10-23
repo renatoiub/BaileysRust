@@ -60,6 +60,16 @@ impl MediaType {
             MediaType::ThumbnailLink => "/mms/image",
         }
     }
+
+    /// `NEWSLETTER_MEDIA_PATH_MAP` — caminho de upload em claro para canal.
+    pub fn newsletter_upload_path(self) -> &'static str {
+        match self {
+            MediaType::Image | MediaType::Sticker | MediaType::ThumbnailLink => "/newsletter/newsletter-image",
+            MediaType::Video | MediaType::Gif | MediaType::Ppt => "/newsletter/newsletter-video",
+            MediaType::Document => "/newsletter/newsletter-document",
+            MediaType::Audio | MediaType::Ptt => "/newsletter/newsletter-audio",
+        }
+    }
 }
 
 /// Chaves derivadas para criptografar/descriptografar mídia.

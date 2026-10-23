@@ -388,6 +388,18 @@ pub struct DebugRetryParams {
     pub assert_session: bool,
 }
 
+/// Resultado do upload em claro (mídia de canal).
+#[derive(Debug, Clone, Default)]
+pub struct PlainUpload {
+    pub media_url: String,
+    pub direct_path: String,
+    pub file_sha256: Vec<u8>,
+    pub file_length: u64,
+    /// `thumbnail_info` devolvido com `server_thumb_gen=1`.
+    pub thumbnail_direct_path: Option<String>,
+    pub thumbnail_sha256: Option<Vec<u8>>,
+}
+
 /// Resultado do upload de mídia.
 #[derive(Debug, Clone)]
 pub struct MediaUpload {
@@ -3992,7 +4004,51 @@ impl Client {
         sink: &WsSink,
         extra_attrs: &[(&str, &str)],
     ) -> Result<SendMessageResult, ClientError> {
+        if jid.ends_with("@newsletter") {
+            return self.send_newsletter(jid, message, message_id, sink, extra_attrs).await;
+        }
         self.send_one_to_one(jid, message, "text", message_id, sink, extra_attrs, None, false).await
+    }
+
+    /// `relayMessage` para canal (`isNewsletter`): sem Signal, o proto vai em
+    /// claro num `<plaintext>` (`encodeNewsletterMessage`, sem padding).
+    pub async fn send_newsletter(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        message_id: &str,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+    ) -> Result<SendMessageResult, ClientError> {
+        let patched = self.patch_message(&message);
+        let mut plaintext = BinaryNode::new("plaintext");
+        if let Some(mediatype) = get_media_type(&patched) {
+            plaintext = plaintext.with_attr("mediatype", mediatype);
+        }
+        let plaintext = plaintext.with_bytes(patched.encode_to_vec());
+
+        let mut stanza = BinaryNode::new("message")
+            .with_attr("to", jid)
+            .with_attr("id", message_id)
+            .with_attr("type", newsletter_message_type(&patched));
+        for &(k, v) in extra_attrs {
+            stanza = stanza.with_attr(k, v);
+        }
+        let stanza = stanza.with_children(vec![plaintext]);
+        self.send_node(&stanza, sink).await?;
+
+        let save = self.save_message_fn.lock().await.clone();
+        if let Some(save) = save {
+            let mid = message_id.to_string();
+            let jid_owned = jid.to_string();
+            let encoded = message.encode_to_vec();
+            tokio::spawn(async move {
+                save(mid, jid_owned, encoded).await;
+            });
+        }
+
+        tracing::info!(msg_id = message_id, jid, kind = "newsletter", "mensagem enviada");
+        Ok(SendMessageResult { message_id: message_id.to_string() })
     }
 
     /// `relayMessage` de retry para 1:1 — `{ messageId, isretry: true, participant }`.
@@ -4381,6 +4437,88 @@ impl Client {
             media_url,
             direct_path,
         })
+    }
+
+    /// Upload em claro para canal (`newsletter: true` do `waUploadToServer`):
+    /// sem `mediaKey`, token = sha256 do arquivo, `server_thumb_gen=1` opcional
+    /// (o servidor devolve `thumbnail_info`).
+    pub async fn upload_media_plain(
+        &self,
+        plaintext: &[u8],
+        path: &str,
+        server_thumb_gen: bool,
+        sink: &WsSink,
+    ) -> Result<PlainUpload, ClientError> {
+        let query = BinaryNode::new("iq")
+            .with_attr("type", "set")
+            .with_attr("xmlns", "w:m")
+            .with_attr("to", S_WHATSAPP_NET)
+            .with_attr("id", self.next_tag())
+            .with_children(vec![BinaryNode::new("media_conn")]);
+        let result = self.query_node(query, sink).await?;
+        let conn = result.child("media_conn").ok_or(ClientError::MediaConn)?;
+        let auth = conn.attr("auth").unwrap_or_default().to_string();
+        let hosts: Vec<String> = conn
+            .children("host")
+            .iter()
+            .map(|h| h.attr("hostname").unwrap_or_default().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if hosts.is_empty() {
+            return Err(ClientError::MediaConn);
+        }
+
+        let file_sha256 = baileys_crypto::sha256(plaintext);
+        let sha_b64 = base64::engine::general_purpose::STANDARD.encode(&file_sha256);
+        let token = baileys_media::encode_base64_for_upload(&sha_b64);
+        let thumb_gen = if server_thumb_gen { "&server_thumb_gen=1" } else { "" };
+
+        let client = reqwest::Client::new();
+        for hostname in &hosts {
+            let url = format!(
+                "https://{hostname}{path}/{token}?auth={auth}&token={token}{thumb_gen}",
+                auth = urlencode(&auth),
+            );
+            let resp = client
+                .post(&url)
+                .header("Content-Type", "application/octet-stream")
+                .header("Origin", "https://web.whatsapp.com")
+                .body(plaintext.to_vec())
+                .send()
+                .await;
+            let json = match resp {
+                Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                    Ok(json) => json,
+                    Err(_) => continue,
+                },
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, hostname, "falha ao enviar mídia de canal");
+                    continue;
+                }
+            };
+            let direct_path = json.get("direct_path").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let media_url = json.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            if direct_path.is_empty() && media_url.is_empty() {
+                continue;
+            }
+            let thumb = json.get("thumbnail_info");
+            return Ok(PlainUpload {
+                media_url,
+                direct_path,
+                file_sha256,
+                file_length: plaintext.len() as u64,
+                thumbnail_direct_path: thumb
+                    .and_then(|t| t.get("thumbnail_direct_path"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                thumbnail_sha256: thumb
+                    .and_then(|t| t.get("thumbnail_sha256"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok()),
+            });
+        }
+        Err(ClientError::MediaUploadFailed)
     }
 
     /// Envia uma mensagem de mídia (imagem/vídeo/áudio/documento).
@@ -6288,6 +6426,25 @@ fn skmsg_enc_node(ciphertext: Vec<u8>) -> BinaryNode {
         .with_attr("v", "2")
         .with_attr("type", "skmsg")
         .with_bytes(ciphertext)
+}
+
+/// `getNewsletterMessageType` do Hineken.
+fn newsletter_message_type(message: &wa::Message) -> &'static str {
+    if message.reaction_message.is_some() || message.enc_reaction_message.is_some() {
+        "reaction"
+    } else if message.poll_creation_message.is_some()
+        || message.poll_creation_message_v2.is_some()
+        || message.poll_creation_message_v3.is_some()
+        || message.poll_update_message.is_some()
+    {
+        "poll"
+    } else if message.event_message.is_some() {
+        "event"
+    } else if get_media_type(message).is_some() {
+        "media"
+    } else {
+        "text"
+    }
 }
 
 fn get_media_type(message: &wa::Message) -> Option<&'static str> {
