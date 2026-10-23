@@ -455,14 +455,6 @@ pub struct Client {
     qr_refs_ended: Arc<std::sync::atomic::AtomicBool>,
     /// Acorda o loop de leitura quando os refs de QR acabam.
     qr_close: Arc<tokio::sync::Notify>,
-    /// Cache de envio: `msg_id` → `(destino, Message codificado)` para o
-    /// reenvio em `<receipt type="retry">` (port de `sendMessageCache`).
-    /// Limitado a `SEND_CACHE_MAX` entradas (FIFO): o retry cai no store Redis
-    /// do app (`load_message_fn`) quando o cache erra, então evictar é seguro.
-    send_cache: Mutex<HashMap<String, (String, Vec<u8>)>>,
-    /// Ordem FIFO de inserção no `send_cache` (msg_id) para evicção da mais
-    /// antiga quando o limite é atingido.
-    send_cache_order: Mutex<Vec<String>>,
     /// JIDs cuja sessão E2E já foi forçada uma vez (port de `caches.forceSession`).
     force_session_cache: TtlCache<()>,
     /// Mutex de retry (port de `retryMutex` do Node) — serializa o
@@ -530,8 +522,6 @@ impl Client {
             qr_rotation: Mutex::new(None),
             qr_refs_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             qr_close: Arc::new(tokio::sync::Notify::new()),
-            send_cache: Mutex::new(HashMap::new()),
-            send_cache_order: Mutex::new(Vec::new()),
             force_session_cache: TtlCache::new(Duration::from_secs(600), 2000),
             retry_mutex: Mutex::new(()),
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000).with_flush_tracking(),
@@ -669,28 +659,6 @@ impl Client {
     /// pre-key via `load`/`store`/`remove`).
     pub fn set_store_extension(&self, ext: Arc<dyn SignalStoreExtension>) {
         self.store.set_extension(ext);
-    }
-
-    /// Insere no `send_cache` com limite FIFO (`SEND_CACHE_MAX`). Remove a
-    /// entrada mais antiga quando o limite é atingido — o retry cai no store
-    /// Redis do app (`load_message_fn`), então a evicção é segura.
-    async fn cache_send(&self, msg_id: String, jid: String, encoded: Vec<u8>) {
-        const SEND_CACHE_MAX: usize = 500;
-        let mut cache = self.send_cache.lock().await;
-        if cache.len() >= SEND_CACHE_MAX {
-            let mut order = self.send_cache_order.lock().await;
-            while cache.len() >= SEND_CACHE_MAX {
-                let Some(oldest) = order.first().cloned() else {
-                    break;
-                };
-                order.remove(0);
-                cache.remove(&oldest);
-            }
-        }
-        if cache.insert(msg_id.clone(), (jid, encoded)).is_none() {
-            // Só registra a ordem em inserção nova (não em substituição).
-            self.send_cache_order.lock().await.push(msg_id);
-        }
     }
 
     /// Criptografa uma mensagem E2E para um JID (usado pelo CallManager).
@@ -3534,7 +3502,7 @@ impl Client {
     ///
     /// Para `type="retry"`, reenvia a mensagem (port de `sendMessagesAgain` +
     /// `relayMessage` do Node): re-garante sessão com o participante (forçada)
-    /// e re-cifra o conteúdo que estava no `send_cache`, respeitando grupo
+    /// e re-cifra o conteúdo lido do store (`getMessage`), respeitando grupo
     /// (sender-key) vs PV (deviceSentMessage).
     async fn handle_receipt(
         &self,
@@ -3895,18 +3863,12 @@ impl Client {
             }
         }
 
-        // `getMessage(key)` (o `sendMessageCache` está comentado no Node). Sem
-        // hook de store, cai no cache em memória do envio.
+        // `getMessage(key)` (o `sendMessageCache` está comentado no Node): só o
+        // store do app. Sem hook, a mensagem não é encontrada.
         let load = self.load_message_fn.lock().await.clone();
         let cached_bytes = match load {
             Some(load) => load(msg_id.clone(), remote.clone()).await.unwrap_or_default(),
-            None => self
-                .send_cache
-                .lock()
-                .await
-                .get(&msg_id)
-                .map(|(_, bytes)| bytes.clone())
-                .unwrap_or_default(),
+            None => Vec::new(),
         };
         if cached_bytes.is_empty() {
             tracing::debug!(msg_id, remote, "Message not found, in retry");
@@ -4300,10 +4262,6 @@ impl Client {
         if tc_sender_timestamp.is_some_and(should_send_new_tc_token) {
             self.issue_privacy_token(&destination_jid, sink).await;
         }
-
-        // Cache para reenvio em retry.
-        self.cache_send(msg_id.to_string(), jid.to_string(), message.encode_to_vec()).await;
-
         // Persiste a mensagem enviada no store do app (fire-and-forget) para
         // reenvio em retry após restart do processo.
         let encoded = message.encode_to_vec();
@@ -4932,7 +4890,6 @@ impl Client {
 
             self.send_node(&stanza, sink).await?;
             tracing::info!(msg_id, jid, "mensagem de grupo reenviada (isretry)");
-            self.cache_send(msg_id.to_string(), jid.to_string(), message.encode_to_vec()).await;
             return Ok(SendMessageResult { message_id: msg_id.to_string() });
         }
 
@@ -5049,10 +5006,6 @@ impl Client {
         let stanza = stanza.with_children(children);
 
         self.send_node(&stanza, sink).await?;
-
-        // Cache para reenvio em retry.
-        self.cache_send(msg_id.to_string(), jid.to_string(), message.encode_to_vec()).await;
-
         // Persiste a mensagem enviada no store do app (fire-and-forget).
         let encoded = message.encode_to_vec();
         let save = self.save_message_fn.lock().await.clone();
