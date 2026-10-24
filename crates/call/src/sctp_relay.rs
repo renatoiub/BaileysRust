@@ -711,27 +711,30 @@ async fn setup_peer(shared: &Arc<Shared>, conn: &Arc<Conn>) -> Result<(), String
         Arc::downgrade(&channel),
     ));
 
-    // Escuta no sid de paridade oposta (negociado, sem DCEP e sem envio): o
-    // laço de aceite do webrtc-rs descarta em silêncio dados de um stream
-    // desconhecido que não comecem com DATA_CHANNEL_OPEN.
-    let rx_channel = pc
-        .create_data_channel(
-            "wa-web-call-rx",
-            Some(RTCDataChannelInit {
-                ordered: Some(false),
-                negotiated: Some(1),
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    rx_channel.on_message(on_message_handler(
-        Arc::downgrade(shared),
-        Arc::downgrade(conn),
-        "rx",
-        Arc::downgrade(&rx_channel),
-    ));
-    lock(&conn.incoming_channels).push(rx_channel);
+    // O webrtc-rs 0.17 conta o id provisório 0 do próprio canal como ocupado e
+    // abre o principal no sid 2; o relay responde no sid 0 (o do libwebrtc).
+    // Canais negociados (sem DCEP e sem envio) escutam o 0 e o 1 — sem eles o
+    // laço de aceite do webrtc-rs descarta esses streams em silêncio.
+    for (label, via, sid) in [("wa-web-call-rx0", "rx0", 0u16), ("wa-web-call-rx1", "rx1", 1u16)] {
+        let rx_channel = pc
+            .create_data_channel(
+                label,
+                Some(RTCDataChannelInit {
+                    ordered: Some(false),
+                    negotiated: Some(sid),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        rx_channel.on_message(on_message_handler(
+            Arc::downgrade(shared),
+            Arc::downgrade(conn),
+            via,
+            Arc::downgrade(&rx_channel),
+        ));
+        lock(&conn.incoming_channels).push(rx_channel);
+    }
 
     let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
     pc.set_local_description(offer.clone())
