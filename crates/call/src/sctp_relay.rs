@@ -83,10 +83,13 @@ struct Conn {
     state: Mutex<ConnState>,
     pc: Mutex<Option<Arc<RTCPeerConnection>>>,
     channel: Mutex<Option<Arc<RTCDataChannel>>>,
+    /// Canais além do principal: o de escuta negociado (sid 1) e os que o
+    /// relay abrir (`on_data_channel`).
     incoming_channels: Mutex<Vec<Arc<RTCDataChannel>>>,
     local_ufrag: Mutex<String>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     first_packet: AtomicBool,
+    first_via: Mutex<std::collections::HashSet<String>>,
     sent_packets: AtomicU64,
     received_packets: AtomicU64,
 }
@@ -103,6 +106,7 @@ impl Conn {
             local_ufrag: Mutex::new(String::new()),
             tasks: Mutex::new(Vec::new()),
             first_packet: AtomicBool::new(false),
+            first_via: Mutex::new(std::collections::HashSet::new()),
             sent_packets: AtomicU64::new(0),
             received_packets: AtomicU64::new(0),
         }
@@ -437,6 +441,7 @@ fn start_keepalive(shared: &Arc<Shared>, conn: &Arc<Conn>) {
     let wc = Arc::downgrade(conn);
     let task = tokio::spawn(async move {
         let mut first = true;
+        let mut keepalives = 0u64;
         loop {
             if !first {
                 tokio::time::sleep(KEEPALIVE_INTERVAL).await;
@@ -452,18 +457,77 @@ fn start_keepalive(shared: &Arc<Shared>, conn: &Arc<Conn>) {
                 tracing::info!("[KEEPALIVE] first ping sent to {}", c.id);
                 first = false;
             }
+            keepalives += 1;
+            if keepalives % 3 == 0 {
+                log_diag(&s, &c, keepalives).await;
+            }
         }
     });
     conn.push_task(task);
 }
 
-fn handle_relay_message(shared: &Shared, conn: &Conn, data: Vec<u8>) {
+/// `[DIAG]` do Node: estado da conexão, contadores e o que o webrtc recebeu.
+async fn log_diag(shared: &Shared, conn: &Conn, keepalives: u64) {
+    use webrtc::stats::StatsReportType;
+
+    let pc = lock(&conn.pc).clone();
+    let dc_state = conn
+        .channel()
+        .map(|c| c.ready_state().to_string())
+        .unwrap_or_else(|| "none".into());
+    let (ice, pc_state) = pc
+        .as_ref()
+        .map(|p| (p.ice_connection_state().to_string(), p.connection_state().to_string()))
+        .unwrap_or_else(|| ("none".into(), "none".into()));
+
+    let mut channels = Vec::new();
+    let mut accepted = 0u32;
+    let mut pair = String::from("none");
+    if let Some(pc) = pc {
+        let report = pc.get_stats().await;
+        for stat in report.reports.values() {
+            match stat {
+                StatsReportType::DataChannel(d) => channels.push(format!(
+                    "{}#{} {} msgs_in={} bytes_in={} msgs_out={}",
+                    d.label, d.data_channel_identifier, d.state, d.messages_received, d.bytes_received, d.messages_sent
+                )),
+                StatsReportType::PeerConnection(p) => accepted = p.data_channels_accepted,
+                StatsReportType::CandidatePair(p) if p.nominated => {
+                    pair = format!(
+                        "pkts_in={} bytes_in={} pkts_out={} bytes_out={}",
+                        p.packets_received, p.bytes_received, p.packets_sent, p.bytes_sent
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    tracing::info!(
+        "[DIAG] {} keepalives={keepalives} dc={dc_state} ice={ice} pc={pc_state} sent={} recv={} pongs={} rtp_recv={} accepted_dcs={accepted} pair[{pair}] channels={:?}",
+        conn.id,
+        conn.sent_packets.load(Ordering::Relaxed),
+        conn.received_packets.load(Ordering::Relaxed),
+        shared.pong_count.load(Ordering::Relaxed),
+        shared.rtp_recv_count.load(Ordering::Relaxed),
+        channels
+    );
+}
+
+fn handle_relay_message(shared: &Shared, conn: &Conn, data: Vec<u8>, via: &str, sid: u16) {
     if data.is_empty() {
         return;
     }
     let received = conn.received_packets.fetch_add(1, Ordering::Relaxed) + 1;
     if !conn.first_packet.swap(true, Ordering::Relaxed) {
         tracing::info!("[SCTP] first packet from {} ({}B)", conn.id, data.len());
+    }
+    if lock(&conn.first_via).insert(format!("{via}#{sid}")) {
+        tracing::info!(
+            "[SCTP] first packet from {} via {via} sid={sid} ({}B)",
+            conn.id,
+            data.len()
+        );
     }
 
     let two_bits = (data[0] & 0xC0) >> 6;
@@ -512,6 +576,8 @@ fn handle_relay_message(shared: &Shared, conn: &Conn, data: Vec<u8>) {
 fn on_message_handler(
     ws: Weak<Shared>,
     wc: Weak<Conn>,
+    via: &'static str,
+    channel: Weak<RTCDataChannel>,
 ) -> Box<
     dyn FnMut(DataChannelMessage) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
@@ -519,7 +585,8 @@ fn on_message_handler(
 > {
     Box::new(move |msg: DataChannelMessage| {
         if let (Some(s), Some(c)) = (ws.upgrade(), wc.upgrade()) {
-            handle_relay_message(&s, &c, msg.data.to_vec());
+            let sid = channel.upgrade().map(|ch| ch.id()).unwrap_or(u16::MAX);
+            handle_relay_message(&s, &c, msg.data.to_vec(), via, sid);
         }
         Box::pin(async {})
     })
@@ -570,7 +637,12 @@ async fn setup_peer(shared: &Arc<Shared>, conn: &Arc<Conn>) -> Result<(), String
                     incoming.label(),
                     incoming.id()
                 );
-                incoming.on_message(on_message_handler(ws.clone(), wc.clone()));
+                incoming.on_message(on_message_handler(
+                    ws.clone(),
+                    wc.clone(),
+                    "incoming",
+                    Arc::downgrade(&incoming),
+                ));
                 lock(&c.incoming_channels).push(incoming);
             }
             Box::pin(async {})
@@ -594,7 +666,11 @@ async fn setup_peer(shared: &Arc<Shared>, conn: &Arc<Conn>) -> Result<(), String
         let wc = Arc::downgrade(conn);
         channel.on_open(Box::new(move || {
             if let (Some(s), Some(c)) = (ws.upgrade(), wc.upgrade()) {
-                tracing::info!("[SCTP] DataChannel open: {}", c.id);
+                tracing::info!(
+                    "[SCTP] DataChannel open: {} sid={}",
+                    c.id,
+                    c.channel().map(|ch| ch.id()).unwrap_or(u16::MAX)
+                );
                 c.set_state(ConnState::Open);
                 send_stun_allocate_on_open(&s, &c);
                 start_keepalive(&s, &c);
@@ -628,7 +704,34 @@ async fn setup_peer(shared: &Arc<Shared>, conn: &Arc<Conn>) -> Result<(), String
             Box::pin(async {})
         }));
     }
-    channel.on_message(on_message_handler(Arc::downgrade(shared), Arc::downgrade(conn)));
+    channel.on_message(on_message_handler(
+        Arc::downgrade(shared),
+        Arc::downgrade(conn),
+        "main",
+        Arc::downgrade(&channel),
+    ));
+
+    // Escuta no sid de paridade oposta (negociado, sem DCEP e sem envio): o
+    // laço de aceite do webrtc-rs descarta em silêncio dados de um stream
+    // desconhecido que não comecem com DATA_CHANNEL_OPEN.
+    let rx_channel = pc
+        .create_data_channel(
+            "wa-web-call-rx",
+            Some(RTCDataChannelInit {
+                ordered: Some(false),
+                negotiated: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    rx_channel.on_message(on_message_handler(
+        Arc::downgrade(shared),
+        Arc::downgrade(conn),
+        "rx",
+        Arc::downgrade(&rx_channel),
+    ));
+    lock(&conn.incoming_channels).push(rx_channel);
 
     let offer = pc.create_offer(None).await.map_err(|e| e.to_string())?;
     pc.set_local_description(offer.clone())

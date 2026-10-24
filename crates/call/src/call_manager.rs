@@ -760,8 +760,16 @@ impl NativeCallManager {
             tracing::info!("[CallManager] ev call accept ignorado (callee) callId={call_id}");
             return;
         }
+        // O `from` do evento cai no `call-creator` quando o `<accept>` não traz
+        // `from` — no caller isso é a nossa própria conta.
+        let peer = Some(from).filter(|f| !f.is_empty() && !self.is_own_account_jid(f, &current.call_creator));
+        if peer.is_none() && !from.is_empty() {
+            tracing::info!(
+                "[CallManager] ev call accept: from={from} é da nossa conta, mantendo SSRC do peer"
+            );
+        }
         tracing::info!("[CallManager] ev call accept → signalPeerAccepted callId={call_id} peer={from}");
-        self.signal_peer_accepted(Some(from).filter(|f| !f.is_empty())).await;
+        self.signal_peer_accepted(peer).await;
     }
 
     // -----------------------------------------------------------------------
@@ -1343,6 +1351,14 @@ impl NativeCallManager {
     /// `signalPeerAccepted` — caller: peer atendeu por um caminho alternativo
     /// (evento `status=accept`, transport/mute_v2 em Ringing). Idempotente.
     async fn signal_peer_accepted(&self, peer_jid: Option<&str>) {
+        let creator = self.current_call().map(|c| c.call_creator).unwrap_or_default();
+        let peer_jid = peer_jid.filter(|p| {
+            let own = self.is_own_account_jid(p, &creator);
+            if own {
+                tracing::info!("[CallManager] signalPeerAccepted: {p} é da nossa conta, mantendo SSRC do peer");
+            }
+            !own
+        });
         let (call_id, snapshot, subs) = {
             let mut st = self.st();
             let Some(call) = st.call.as_mut().filter(|c| !c.is_ended() && c.is_initiator()) else {
