@@ -55,7 +55,7 @@ Todas as rotas usam o shape `retorno` do Node:
 | `POST /messages/sendLinkPreview` | `{ key, jid, url, title?, description?, thumbnailUrl? }` | Link preview |
 | `POST /messages/ForwardMessage` | `{ key, jid, forwardId }` | Encaminha |
 | `POST /messages/SendContact` | `{ key, jid, contactName, contactNumber }` | Contato |
-| `POST /messages/sendButton/{tipo}` | `{ key, jid, text?, footer?, header?, bizNode?, ... }` | **Só Rust** (experimental). `tipo`: `buttons`, `template`, `list`, `interactive`, `quick_reply`, `cta_url`, `cta_copy`, `cta_call`, `single_select`, `carousel`, `pix`, `pay`, `shop`, `collection`, `catalog`, `location_request`, `webview`. Builders em `baileys_socket::interactive`; `bizNode` = `hineken` (padrão), `zapo` ou `none` |
+| `POST /messages/sendButton/{tipo}` | `{ key, jid, text?, footer?, header?, bizNode?, ... }` | **Só Rust** (experimental). `tipo`: `buttons`, `template`, `list`, `interactive`, `quick_reply`, `cta_url`, `cta_copy`, `cta_call`, `single_select`, `carousel`, `pix`, `pay`, `shop`, `collection`, `catalog`, `location_request`, `webview`, e mídia + texto + botões em `image`, `video`, `document`, `location` (`format`: `interactive` padrão, `buttons` ou `template`). Builders em `baileys_socket::interactive`; `bizNode` = `hineken` (padrão), `zapo` ou `none` |
 
 ### 3.3 `/misc`
 
