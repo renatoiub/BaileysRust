@@ -4185,6 +4185,24 @@ impl Client {
         self.send_one_to_one(jid, message, "text", message_id, sink, extra_attrs, None, false).await
     }
 
+    /// `relayMessage` 1:1 com nós extras no stanza (`additionalNodes`, ex.:
+    /// `<biz>` de [`crate::interactive::button_addon_node`]). Canal ignora os nós.
+    pub async fn relay_message_with_nodes(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        message_id: &str,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+        extra_nodes: &[BinaryNode],
+    ) -> Result<SendMessageResult, ClientError> {
+        if jid.ends_with("@newsletter") {
+            return self.send_newsletter(jid, message, message_id, sink, extra_attrs).await;
+        }
+        self.send_one_to_one_nodes(jid, message, "text", message_id, sink, extra_attrs, extra_nodes, None, false)
+            .await
+    }
+
     /// `relayMessage` para canal (`isNewsletter`): sem Signal, o proto vai em
     /// claro num `<plaintext>` (`encodeNewsletterMessage`, sem padding).
     pub async fn send_newsletter(
@@ -4272,6 +4290,25 @@ impl Client {
         msg_id: &str,
         sink: &WsSink,
         extra_attrs: &[(&str, &str)],
+        participant: Option<&RelayParticipant>,
+        is_retry: bool,
+    ) -> Result<SendMessageResult, ClientError> {
+        self.send_one_to_one_nodes(jid, message, msg_type, msg_id, sink, extra_attrs, &[], participant, is_retry)
+            .await
+    }
+
+    /// [`Self::send_one_to_one`] com nós extras no fim do `<message>`
+    /// (`additionalNodes` / `<biz>` dos botões).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_one_to_one_nodes(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        msg_type: &str,
+        msg_id: &str,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+        extra_nodes: &[BinaryNode],
         participant: Option<&RelayParticipant>,
         is_retry: bool,
     ) -> Result<SendMessageResult, ClientError> {
@@ -4473,6 +4510,7 @@ impl Client {
             Some((&other_msg, msg_id, None)),
         );
         children.extend(tail);
+        children.extend(extra_nodes.iter().cloned());
 
         let mut stanza = BinaryNode::new("message")
             .with_attr("id", msg_id)
@@ -5033,6 +5071,20 @@ impl Client {
         self.send_group(jid, message, message_id, sink, extra_attrs, None, false).await
     }
 
+    /// `relayMessage` para grupos com nós extras no stanza (`<biz>` etc.).
+    pub async fn relay_group_message_with_nodes(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        message_id: &str,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+        extra_nodes: &[BinaryNode],
+    ) -> Result<SendMessageResult, ClientError> {
+        self.send_group_nodes(jid, message, message_id, sink, extra_attrs, extra_nodes, None, false)
+            .await
+    }
+
     /// `relayMessage` de retry para grupo — `{ messageId, isretry: true, participant }`.
     ///
     /// Port do `relayMessage` do Node com `participant` (retry de grupo):
@@ -5076,6 +5128,23 @@ impl Client {
         msg_id: &str,
         sink: &WsSink,
         extra_attrs: &[(&str, &str)],
+        participant: Option<&RelayParticipant>,
+        is_retry: bool,
+    ) -> Result<SendMessageResult, ClientError> {
+        self.send_group_nodes(jid, message, msg_id, sink, extra_attrs, &[], participant, is_retry)
+            .await
+    }
+
+    /// [`Self::send_group`] com nós extras no fim do `<message>`.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_group_nodes(
+        &self,
+        jid: &str,
+        message: wa::Message,
+        msg_id: &str,
+        sink: &WsSink,
+        extra_attrs: &[(&str, &str)],
+        extra_nodes: &[BinaryNode],
         participant: Option<&RelayParticipant>,
         is_retry: bool,
     ) -> Result<SendMessageResult, ClientError> {
@@ -5307,6 +5376,7 @@ impl Client {
         children.extend(
             self.relay_stanza_tail(should_include_device_identity, None, jid, false, Some((&patched, msg_id, None))).0,
         );
+        children.extend(extra_nodes.iter().cloned());
 
         let mut stanza = BinaryNode::new("message")
             .with_attr("id", msg_id)

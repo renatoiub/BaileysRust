@@ -55,6 +55,7 @@ Todas as rotas usam o shape `retorno` do Node:
 | `POST /messages/sendLinkPreview` | `{ key, jid, url, title?, description?, thumbnailUrl? }` | Link preview |
 | `POST /messages/ForwardMessage` | `{ key, jid, forwardId }` | Encaminha |
 | `POST /messages/SendContact` | `{ key, jid, contactName, contactNumber }` | Contato |
+| `POST /messages/sendButton/{tipo}` | `{ key, jid, text?, footer?, header?, bizNode?, ... }` | **Só Rust** (experimental). `tipo`: `buttons`, `template`, `list`, `interactive`, `quick_reply`, `cta_url`, `cta_copy`, `cta_call`, `single_select`, `carousel`, `pix`, `pay`, `shop`, `collection`, `catalog`, `location_request`, `webview`. Builders em `baileys_socket::interactive`; `bizNode` = `hineken` (padrão), `zapo` ou `none` |
 
 ### 3.3 `/misc`
 
@@ -110,6 +111,10 @@ Todas as rotas usam o shape `retorno` do Node:
 4. **QR**: renderizado como SVG data-URL (mesmo HTML do Node).
 5. **`retorno`** mantém `error`/`message`/`retorno`; status HTTP pode divergir
    minimamente do Express em casos de borda (documentados por teste).
+6. **`/messages/sendButton/{tipo}`** existe só no Rust: o Node não tem rotas de
+   botões. O nó `<biz>` é anexado no relay (`RelaySendJob.biz_node`) e a
+   detecção desembrulha `viewOnce*`/`ephemeral`/`deviceSent`, ao contrário do
+   `getButtonType` da Hineken.
 
 ## 5. Contrato de sessão (swap sem QR)
 

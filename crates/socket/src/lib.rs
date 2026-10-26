@@ -5,6 +5,7 @@ pub mod cache;
 pub mod client;
 pub mod groups;
 pub mod handshake;
+pub mod interactive;
 pub mod link_preview;
 pub mod media;
 pub mod noise;
