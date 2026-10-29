@@ -364,7 +364,7 @@ impl<'a> SessionCipher<'a> {
         let msg = super::whisper::WhisperMessage {
             ephemeral_key: Some(ephemeral_pub.clone()),
             counter: Some(chain_counter as u32),
-            previous_counter: Some(previous_counter),
+            previous_counter: Some(previous_counter.max(0) as u32),
             ciphertext: Some(super::crypto::encrypt(&chain_key_bytes[0], data, &chain_key_bytes[2][..16])?),
         };
         let msg_buf = msg.encode_to_vec();
@@ -597,7 +597,7 @@ return Err(SignalError::DecryptOnSendingChain);
         // previous counter from old sending chain
         let eph_pub = super::record::decode_b64(&session.current_ratchet.ephemeral_key_pair.pub_key);
         if let Some(prev_sending) = session.get_chain(&eph_pub) {
-            session.current_ratchet.previous_counter = prev_sending.chain_key.counter as u32;
+            session.current_ratchet.previous_counter = prev_sending.chain_key.counter;
             session.delete_chain(&eph_pub)?;
         }
 

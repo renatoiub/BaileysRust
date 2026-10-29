@@ -119,7 +119,7 @@ pub struct Ratchet {
     #[serde(alias = "last_remote_ephemeral_key")]
     pub last_remote_ephemeral_key: String,
     #[serde(alias = "previous_counter")]
-    pub previous_counter: u32,
+    pub previous_counter: i32,
     #[serde(alias = "root_key")]
     pub root_key: String,
 }
