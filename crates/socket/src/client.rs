@@ -3939,7 +3939,9 @@ impl Client {
         let msg_id = msg_id.to_string();
         let remote = remote.to_string();
 
-        let cache_key = format!("{msg_id}:{remote}");
+        // Por participante (mesma chave do `will_key`): em grupo, cada device que
+        // pede retry precisa do próprio reenvio + reparo de sessão.
+        let cache_key = format!("{msg_id}:{}", node.attr("participant").unwrap_or(from.as_str()));
         let mut retry_count = self.msg_retry_cache.get(&cache_key).await.unwrap_or(0);
         if retry_count >= self.config.max_msg_retry_count {
             tracing::debug!(retry_count, cache_key, "reached retry limit, clearing");
