@@ -311,6 +311,15 @@ fn call_status_from_node(node: &BinaryNode) -> &'static str {
 /// `NO_MESSAGE_FOUND_ERROR_TEXT` do Hineken.
 const NO_MESSAGE_FOUND_ERROR_TEXT: &str = "Message absent from node";
 
+/// `RETRY_MAX_AGE_S` (padrão 900, mínimo 60): retry de mensagem mais antiga é ignorado.
+fn retry_max_age_s() -> u64 {
+    std::env::var("RETRY_MAX_AGE_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(900)
+        .max(60)
+}
+
 /// Retorno do `decodeMessageNode`: `fullMessage` (key crua), `author`,
 /// `sender` (`author` em chat 1:1, `chatId` nos demais) e `category`.
 struct DecodedMessageNode {
@@ -3982,6 +3991,22 @@ impl Client {
             }
         });
 
+        // Depois de uma tempestade, o acúmulo de retries antigos atrasa os das
+        // mensagens novas: `<retry t>` é o horário original da mensagem.
+        let sent_at: u64 = node
+            .child("retry")
+            .and_then(|r| r.attr("t"))
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(0);
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if sent_at > 0 && now_s.saturating_sub(sent_at) > retry_max_age_s() {
+            tracing::debug!(msg_id, sent_at, "skipping retry for old message");
+            return Ok(());
+        }
+
         // `key.participant = key.participant || attrs.from` +
         // `willSendMessageAgain(ids[0], key.participant)`.
         let will_key = format!("{msg_id}:{}", participant.clone().unwrap_or_else(|| from.clone()));
@@ -5415,8 +5440,9 @@ impl Client {
         };
 
         let mut sender_key_jids: Vec<String> = Vec::new();
-        // `sender-key-memory` do Node: `senderKeyMap[senderId] = true` — reuso
-        // da distribuição de sender key já conhecida por grupo (anti-ban).
+        // `sender-key-memory`: SKDM só para quem ainda não tem a sender key.
+        // Mandar para todos a cada mensagem gera ~1 pkmsg por device em grupo
+        // grande; o retry remove o device do mapa e o reset de grupo zera o mapa.
         let mut sender_key_map: HashMap<String, bool> =
             self.sender_key_memory.get(jid).await.unwrap_or_default();
         for (user, device, dev_jid) in &devices {
@@ -5431,9 +5457,19 @@ impl Client {
             } else {
                 format!("{user}:{device}@{server}")
             };
+            if sender_key_map.contains_key(&sender_id) {
+                continue;
+            }
             sender_key_map.insert(sender_id.clone(), true);
             sender_key_jids.push(sender_id);
         }
+        tracing::info!(
+            jid,
+            msg_id,
+            devices = devices.len(),
+            skdm = sender_key_jids.len(),
+            "[groupSend]"
+        );
         if !sender_key_map.is_empty() {
             self.sender_key_memory.set(jid.to_string(), sender_key_map).await;
         }
