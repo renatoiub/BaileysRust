@@ -1,7 +1,6 @@
 //! `baileys-socket` — socket WhatsApp (handshake Noise, WebSocket, eventos).
 
 pub mod app_state;
-pub mod auto_heal;
 pub mod cache;
 pub mod client;
 pub mod groups;

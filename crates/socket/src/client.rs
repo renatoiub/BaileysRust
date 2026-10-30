@@ -311,32 +311,6 @@ fn call_status_from_node(node: &BinaryNode) -> &'static str {
 /// `NO_MESSAGE_FOUND_ERROR_TEXT` do Hineken.
 const NO_MESSAGE_FOUND_ERROR_TEXT: &str = "Message absent from node";
 
-/// `RETRY_DEDUPE_S` (padrão 300): janela em que o mesmo `msgId:device` não é reenviado de novo.
-fn retry_dedupe_s() -> u64 {
-    std::env::var("RETRY_DEDUPE_S")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(300)
-}
-
-/// `RETRY_MSG_BUDGET` (padrão 0 = sem teto): total de reenvios por `msgId`.
-fn retry_msg_budget() -> u32 {
-    std::env::var("RETRY_MSG_BUDGET")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-}
-
-/// `RETRY_MAX_AGE_S` (padrão 900, mínimo 60): retry de mensagem mais antiga é ignorado.
-fn retry_max_age_s() -> u64 {
-    std::env::var("RETRY_MAX_AGE_S")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(900)
-        .max(60)
-}
-
 /// Retorno do `decodeMessageNode`: `fullMessage` (key crua), `author`,
 /// `sender` (`author` em chat 1:1, `chatId` nos demais) e `category`.
 struct DecodedMessageNode {
@@ -441,8 +415,6 @@ pub struct SendMessageResult {
 pub struct RelayParticipant {
     pub jid: String,
     pub count: u32,
-    /// `t` original da mensagem (do `<retry t>`), repetido no reenvio de grupo.
-    pub t: Option<String>,
 }
 
 /// Parâmetros configuráveis do retry manual (`/manager/retry`).
@@ -495,7 +467,6 @@ pub struct MediaUpload {
 
 type PendingQuery = tokio::sync::oneshot::Sender<BinaryNode>;
 
-use crate::auto_heal::{is_session_decrypt_error, AutoHeal, HealAction};
 use crate::cache::TtlCache;
 
 /// Sink de escrita do WebSocket (compartilhado entre `run` e as operações).
@@ -561,10 +532,6 @@ pub struct Client {
     msg_retry_cache: TtlCache<u32>,
     /// `placeholderResendCache` — evita PDOs duplicados para o mesmo msg id.
     placeholder_resend_cache: TtlCache<()>,
-    /// `msgId:device` já reenviado (TTL `RETRY_DEDUPE_S`): retry repetido só leva ack.
-    resend_dedupe: TtlCache<()>,
-    /// Total de reenvios por `msgId` (teto opcional `RETRY_MSG_BUDGET`).
-    resend_budget: TtlCache<u32>,
     /// `lidCache` — mapeia `@s.whatsapp.net` → `@lid` (evita USync repetido).
     lid_cache: TtlCache<String>,
     /// `devicesCache` — fanout de devices por JID (evita USync repetido).
@@ -593,8 +560,6 @@ pub struct Client {
     pending_app_state_sync: std::sync::atomic::AtomicBool,
     /// Serializa o `resyncAppState` (o Node roda dentro de `keys.transaction`).
     app_state_mutex: Mutex<()>,
-    /// Detector de sender key / sessão quebrada (ver `auto_heal`).
-    auto_heal: AutoHeal,
 }
 
 impl Client {
@@ -610,7 +575,6 @@ impl Client {
         // que fica para trás perde eventos (`Lagged`).
         let (events, _) = tokio::sync::broadcast::channel(4096);
 
-        let auto_heal = AutoHeal::new(config.auto_heal.clone());
         let client = Self {
             store,
             config,
@@ -627,12 +591,10 @@ impl Client {
             qr_rotation: Mutex::new(None),
             qr_refs_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             qr_close: Arc::new(tokio::sync::Notify::new()),
-            force_session_cache: TtlCache::new(Duration::from_secs(3600), 50_000),
+            force_session_cache: TtlCache::new(Duration::from_secs(600), 2000),
             retry_mutex: Mutex::new(()),
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000).with_flush_tracking(),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
-            resend_dedupe: TtlCache::new(Duration::from_secs(retry_dedupe_s()), 200_000),
-            resend_budget: TtlCache::new(Duration::from_secs(3600), 50_000),
             lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             devices_cache: TtlCache::new(Duration::from_secs(1000), 2000),
             on_whatsapp_cache: TtlCache::new(Duration::from_secs(7200), 1000),
@@ -646,7 +608,6 @@ impl Client {
             privacy_settings: Mutex::new(None),
             pending_app_state_sync: std::sync::atomic::AtomicBool::new(false),
             app_state_mutex: Mutex::new(()),
-            auto_heal,
         };
         client.apply_cache_config();
         Ok(client)
@@ -740,59 +701,6 @@ impl Client {
             .me
             .and_then(|m| m.lid)
             .unwrap_or_default()
-    }
-
-    /// Descarta a sender key desta conexão no grupo: o próximo envio gera uma
-    /// nova e distribui para todos os devices. Retorna os nomes resetados.
-    pub async fn reset_group_sender_key(&self, group: &str) -> Result<Vec<String>, ClientError> {
-        let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
-        let mut names = Vec::new();
-        for me in [self.me_lid(), self.me_id()] {
-            if me.is_empty() {
-                continue;
-            }
-            let name = repo.reset_sender_key(group, &me)?;
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        self.sender_key_memory.remove(group).await;
-        self.group_meta_cache.remove(group).await;
-        Ok(names)
-    }
-
-    /// Apaga a sessão Signal com um device e busca um bundle novo: o próximo
-    /// envio sai como `pkmsg` e o outro lado recria a sessão.
-    pub async fn reset_device_session(&self, jid: &str) -> Result<String, ClientError> {
-        let address = SignalRepository::new(self.store.as_ref() as &dyn SignalStore)
-            .jid_to_signal_protocol_address(jid)?;
-        self.store.remove_generic("session", &address);
-        self.devices_cache.remove(&baileys_core::jid_normalized_user(jid)).await;
-        let sink = self.sink().await.ok_or(ClientError::ConnectionClosed)?;
-        self.assert_sessions(&[jid.to_string()], true, None, &sink).await?;
-        Ok(address)
-    }
-
-    /// Executa as ações do auto-heal (log em `[autoHeal]`, falha não propaga).
-    async fn run_heal_actions(&self, actions: Vec<HealAction>) {
-        for action in actions {
-            match action {
-                HealAction::GroupReset { group, users, threshold } => match self.reset_group_sender_key(&group).await {
-                    Ok(names) => tracing::warn!(
-                        group,
-                        users,
-                        threshold,
-                        sender_keys = names.len(),
-                        "[autoHeal] groupReset reason=retry"
-                    ),
-                    Err(e) => tracing::error!(group, error = %e, "[autoHeal] groupReset falhou"),
-                },
-                HealAction::SessionReset { jid, reason, count } => match self.reset_device_session(&jid).await {
-                    Ok(address) => tracing::warn!(jid, address, reason, count, "[autoHeal] sessionReset"),
-                    Err(e) => tracing::error!(jid, reason, error = %e, "[autoHeal] sessionReset falhou"),
-                },
-            }
-        }
     }
 
     /// Registra os callbacks de store de mensagens (port do `getMessage`/
@@ -2238,12 +2146,6 @@ impl Client {
                 }
             } else {
                 self.send_message_ack(node, sink).await?;
-                if is_session_decrypt_error(&stub) {
-                    if let Some(action) = self.auto_heal.note_decrypt_failure(&author, std::time::Instant::now()) {
-                        let client = self.clone();
-                        tokio::spawn(async move { client.run_heal_actions(vec![action]).await });
-                    }
-                }
                 let client = self.clone();
                 let sink = sink.clone();
                 let retry_node = node.clone();
@@ -3937,22 +3839,6 @@ impl Client {
             tracing::warn!(error = %e, msg_id, "retry: processamento falhou (ack enviado mesmo assim)");
         }
         self.send_message_ack(node, sink).await?;
-
-        let group_size = if baileys_core::is_jid_group(&from) {
-            self.group_meta_cache.get(&from).await.map(|m| m.size).unwrap_or(0)
-        } else {
-            0
-        };
-        let actions = self.auto_heal.note_retry(
-            &from,
-            participant.as_deref(),
-            &msg_id,
-            group_size,
-            std::time::Instant::now(),
-        );
-        if !actions.is_empty() {
-            self.run_heal_actions(actions).await;
-        }
         Ok(())
     }
 
@@ -4016,39 +3902,6 @@ impl Client {
             }
         });
 
-        // Depois de uma tempestade, o acúmulo de retries antigos atrasa os das
-        // mensagens novas: `<retry t>` é o horário original da mensagem.
-        let sent_at: u64 = node
-            .child("retry")
-            .and_then(|r| r.attr("t"))
-            .and_then(|t| t.parse().ok())
-            .unwrap_or(0);
-        let now_s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if sent_at > 0 && now_s.saturating_sub(sent_at) > retry_max_age_s() {
-            tracing::debug!(msg_id, sent_at, "skipping retry for old message");
-            return Ok(());
-        }
-
-        // O mesmo device pedindo retry da mesma mensagem logo após o reenvio
-        // entra em loop: dentro de `RETRY_DEDUPE_S` só leva o ack.
-        let dedupe_key = format!("{msg_id}:{}", participant.clone().unwrap_or_else(|| from.clone()));
-        if self.resend_dedupe.get(&dedupe_key).await.is_some() {
-            tracing::debug!(dedupe_key, "retry ignored, resent recently");
-            return Ok(());
-        }
-        let budget = retry_msg_budget();
-        let resent_for_msg = self.resend_budget.get(&msg_id).await.unwrap_or(0);
-        if budget > 0 && resent_for_msg >= budget {
-            if resent_for_msg == budget {
-                self.resend_budget.set(msg_id.clone(), resent_for_msg + 1).await;
-                tracing::error!(msg_id, sent = resent_for_msg, "[retryBudget]");
-            }
-            return Ok(());
-        }
-
         // `key.participant = key.participant || attrs.from` +
         // `willSendMessageAgain(ids[0], key.participant)`.
         let will_key = format!("{msg_id}:{}", participant.clone().unwrap_or_else(|| from.clone()));
@@ -4062,17 +3915,13 @@ impl Client {
             return Ok(());
         }
 
-        // Sem `clear()` no erro: zerar o cache inteiro reabre o retry de todo mundo.
+        // `catch` do Node: `msgRetryCache.flushAll()`.
         let result = self
             .resend_retry(node, sink, &msg_id, &remote, retry_participant)
             .await;
-        match &result {
-            Ok(()) => {
-                self.resend_dedupe.set(dedupe_key, ()).await;
-                let sent = self.resend_budget.get(&msg_id).await.unwrap_or(0);
-                self.resend_budget.set(msg_id.clone(), sent + 1).await;
-            }
-            Err(e) => tracing::error!(msg_id, error = %e, "error in sending message again"),
+        if let Err(e) = &result {
+            tracing::error!(msg_id, error = %e, "error in sending message again");
+            self.msg_retry_cache.clear().await;
         }
         result
     }
@@ -4101,16 +3950,8 @@ impl Client {
         retry_count += 1;
         self.msg_retry_cache.set(cache_key, retry_count).await;
 
-        // Só o device que pediu retry sai do mapa; remover o grupo inteiro
-        // redistribui a sender key para todos a cada retry.
         if baileys_core::is_jid_group(&remote) {
-            if let Some(participant) = retry_participant.as_deref() {
-                if let Some(mut memory) = self.sender_key_memory.get(&remote).await {
-                    if memory.remove(participant).is_some() {
-                        self.sender_key_memory.set(remote.clone(), memory).await;
-                    }
-                }
-            }
+            self.sender_key_memory.remove(&remote).await;
         }
 
         // Tenta extrair e injetar a sessão E2E do bundle `<keys>` do retry
@@ -4190,23 +4031,22 @@ impl Client {
             }
         }
 
-        // Sem bundle injetado: política do whatsmeow (`shouldRecreateSession`).
-        // Recriar a sessão a cada retry troca a sessão de centenas de celulares
-        // por mensagem e o envio seguinte sai numa sessão que eles não têm. Só
-        // busca chaves novas sem sessão (assert sem force) ou com `count >= 2`,
-        // no máximo uma vez por hora por device (`force_session_cache`, 1h).
+        // Sem bundle injetado → re-garante sessão com o participante.
+        // `force` segue o `forceSession` do Node: forçado na primeira vez,
+        // depois reusa.
+        //
+        // Node: `if (!injectedFromBundle && retryParticipantJid)` — para grupo
+        // sem participant, NÃO re-garante sessão (não há device alvo).
         if !injected_from_bundle {
             if let Some(retry_participant_jid) = retry_participant.as_deref() {
-                let count_in_node = node
-                    .child("retry")
-                    .and_then(|r| r.attr("count"))
-                    .and_then(|c| c.parse::<u32>().ok())
-                    .unwrap_or(1);
-                let force = count_in_node >= 2
-                    && !self.force_session_cache.contains(retry_participant_jid).await;
-                if force {
-                    self.force_session_cache.set(retry_participant_jid.to_string(), ()).await;
-                }
+                let force = {
+                    if self.force_session_cache.contains(retry_participant_jid).await {
+                        false
+                    } else {
+                        self.force_session_cache.set(retry_participant_jid.to_string(), ()).await;
+                        true
+                    }
+                };
                 let lids = self.node_get_lid(retry_participant_jid, sink).await?;
                 self.assert_sessions(&[retry_participant_jid.to_string()], force, lids.as_deref(), sink).await?;
             }
@@ -4256,7 +4096,6 @@ impl Client {
                 let relay_participant = RelayParticipant {
                     jid: retry_participant_jid.to_string(),
                     count: retry_count.max(1),
-                    t: node.child("retry").and_then(|r| r.attr("t")).map(String::from),
                 };
                 if baileys_core::is_jid_group(&target_jid) {
                     self.relay_group_message_retry(
@@ -5360,14 +5199,19 @@ impl Client {
         let patched = self.patch_message(&message);
 
         if let Some(participant) = participant {
-            // Só o SKDM (whatsmeow `builder.Create`): `encrypt_group_message`
-            // cifraria e descartaria uma mensagem, avançando a cadeia a cada retry.
-            let skdm = repo.sender_key_distribution(jid, &me_lid)?;
+            // Node: encryptGroupMessage({ group: destinationJid, data: bytes, meId: meLid }).
+            let enc = repo.encrypt_group_message(
+                jid,
+                &me_lid,
+                &write_random_pad_max16(&patched.encode_to_vec()),
+            )?;
             let message_to_send = {
                 let mut patched = patched.clone();
                 patched.sender_key_distribution_message =
                     Some(wa::message::SenderKeyDistributionMessage {
-                        axolotl_sender_key_distribution_message: Some(skdm),
+                        axolotl_sender_key_distribution_message: Some(
+                            enc.sender_key_distribution_message.clone(),
+                        ),
                         group_id: Some(jid.to_string()),
                     });
                 patched
@@ -5385,21 +5229,18 @@ impl Client {
 
             // Node linha 654: `stanza.attrs.to = destinationJid` +
             // `stanza.attrs.participant = participant.jid`.
-            // whatsmeow/zapo: `addressing_mode` pelo servidor de quem pediu,
-            // `t` original e sem `peer_recipient_lid` (só existe em 1:1).
-            let retry_addressing = if baileys_core::is_lid_user(&participant.jid) { "lid" } else { "pn" };
             let mut stanza = BinaryNode::new("message")
                 .with_attr("id", msg_id)
                 .with_attr("type", get_message_type(&message))
-                .with_attr("addressing_mode", retry_addressing);
+                .with_attr("addressing_mode", addressing_mode);
             for &(k, v) in extra_attrs {
                 stanza = stanza.with_attr(k, v);
             }
             stanza = stanza
                 .with_attr("to", jid)
                 .with_attr("participant", &participant.jid);
-            if let Some(t) = &participant.t {
-                stanza = stanza.with_attr("t", t);
+            if let Some(lid) = &lid {
+                stanza = stanza.with_attr("peer_recipient_lid", lid);
             }
             let stanza = stanza.with_children(children);
 
@@ -5487,9 +5328,8 @@ impl Client {
         };
 
         let mut sender_key_jids: Vec<String> = Vec::new();
-        // `sender-key-memory`: SKDM só para quem ainda não tem a sender key.
-        // Mandar para todos a cada mensagem gera ~1 pkmsg por device em grupo
-        // grande; o retry remove o device do mapa e o reset de grupo zera o mapa.
+        // `sender-key-memory` do Node: `senderKeyMap[senderId] = true` — reuso
+        // da distribuição de sender key já conhecida por grupo (anti-ban).
         let mut sender_key_map: HashMap<String, bool> =
             self.sender_key_memory.get(jid).await.unwrap_or_default();
         for (user, device, dev_jid) in &devices {
@@ -5504,19 +5344,9 @@ impl Client {
             } else {
                 format!("{user}:{device}@{server}")
             };
-            if sender_key_map.contains_key(&sender_id) {
-                continue;
-            }
             sender_key_map.insert(sender_id.clone(), true);
             sender_key_jids.push(sender_id);
         }
-        tracing::info!(
-            jid,
-            msg_id,
-            devices = devices.len(),
-            skdm = sender_key_jids.len(),
-            "[groupSend]"
-        );
         if !sender_key_map.is_empty() {
             self.sender_key_memory.set(jid.to_string(), sender_key_map).await;
         }

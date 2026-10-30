@@ -424,8 +424,6 @@ pub struct ClientConfig {
     pub cache_provider: Option<std::sync::Arc<dyn crate::cache::CacheStore>>,
     /// Prefixo dos caches por conexão no provider (`cache:instance:{key}:*`).
     pub cache_instance_key: Option<String>,
-    /// Limites do auto-heal (reset de sender key de grupo / sessão de device).
-    pub auto_heal: crate::auto_heal::AutoHealConfig,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -460,7 +458,6 @@ impl Default for ClientConfig {
             cache_control: true,
             cache_provider: None,
             cache_instance_key: None,
-            auto_heal: crate::auto_heal::AutoHealConfig::default(),
         }
     }
 }

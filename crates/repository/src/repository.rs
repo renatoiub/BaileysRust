@@ -6,7 +6,7 @@
 //! `jidToSignalProtocolAddress`.
 
 use baileys_signal::protocol::group::{
-    GroupCipher, GroupSessionBuilder, SenderKeyDistributionMessage, SenderKeyRecord,
+    GroupCipher, GroupSessionBuilder, SenderKeyDistributionMessage,
 };
 use baileys_signal::protocol::session::{
     jid_to_signal_protocol_address, DeviceBundle, SessionBuilder, SessionCipher,
@@ -126,23 +126,6 @@ impl<'a> SignalRepository<'a> {
             ciphertext,
             sender_key_distribution_message: distribution.serialize().to_vec(),
         })
-    }
-
-    /// SKDM com o estado atual da sender key, sem cifrar: não avança a cadeia
-    /// (o reenvio de retry não pode consumir iterações).
-    pub fn sender_key_distribution(&self, group: &str, me_id: &str) -> Result<Vec<u8>> {
-        let name = jid_to_signal_sender_key_name(group, me_id);
-        let builder = GroupSessionBuilder::new(self.store);
-        Ok(builder.create(&name)?.serialize().to_vec())
-    }
-
-    /// Troca a sender key própria do grupo por um registro vazio; o próximo
-    /// `encrypt_group_message` gera uma nova. Sobrescreve em vez de apagar para
-    /// não depender do delete (o load cai no SQLite quando falta na extensão).
-    pub fn reset_sender_key(&self, group: &str, me_id: &str) -> Result<String> {
-        let name = jid_to_signal_sender_key_name(group, me_id);
-        self.store.store_sender_key(&name, &SenderKeyRecord::default())?;
-        Ok(name.to_string())
     }
 
     /// `injectE2ESession` — injeta uma sessão recebida via `<key>`/`<skey>`.
