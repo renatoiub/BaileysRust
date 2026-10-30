@@ -467,6 +467,7 @@ pub struct MediaUpload {
 
 type PendingQuery = tokio::sync::oneshot::Sender<BinaryNode>;
 
+use crate::auto_heal::{is_session_decrypt_error, AutoHeal, HealAction};
 use crate::cache::TtlCache;
 
 /// Sink de escrita do WebSocket (compartilhado entre `run` e as operações).
@@ -560,6 +561,8 @@ pub struct Client {
     pending_app_state_sync: std::sync::atomic::AtomicBool,
     /// Serializa o `resyncAppState` (o Node roda dentro de `keys.transaction`).
     app_state_mutex: Mutex<()>,
+    /// Detector de sender key / sessão quebrada (ver `auto_heal`).
+    auto_heal: AutoHeal,
 }
 
 impl Client {
@@ -575,6 +578,7 @@ impl Client {
         // que fica para trás perde eventos (`Lagged`).
         let (events, _) = tokio::sync::broadcast::channel(4096);
 
+        let auto_heal = AutoHeal::new(config.auto_heal.clone());
         let client = Self {
             store,
             config,
@@ -608,6 +612,7 @@ impl Client {
             privacy_settings: Mutex::new(None),
             pending_app_state_sync: std::sync::atomic::AtomicBool::new(false),
             app_state_mutex: Mutex::new(()),
+            auto_heal,
         };
         client.apply_cache_config();
         Ok(client)
@@ -701,6 +706,59 @@ impl Client {
             .me
             .and_then(|m| m.lid)
             .unwrap_or_default()
+    }
+
+    /// Descarta a sender key desta conexão no grupo: o próximo envio gera uma
+    /// nova e distribui para todos os devices. Retorna os nomes resetados.
+    pub async fn reset_group_sender_key(&self, group: &str) -> Result<Vec<String>, ClientError> {
+        let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
+        let mut names = Vec::new();
+        for me in [self.me_lid(), self.me_id()] {
+            if me.is_empty() {
+                continue;
+            }
+            let name = repo.reset_sender_key(group, &me)?;
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        self.sender_key_memory.remove(group).await;
+        self.group_meta_cache.remove(group).await;
+        Ok(names)
+    }
+
+    /// Apaga a sessão Signal com um device e busca um bundle novo: o próximo
+    /// envio sai como `pkmsg` e o outro lado recria a sessão.
+    pub async fn reset_device_session(&self, jid: &str) -> Result<String, ClientError> {
+        let address = SignalRepository::new(self.store.as_ref() as &dyn SignalStore)
+            .jid_to_signal_protocol_address(jid)?;
+        self.store.remove_generic("session", &address);
+        self.devices_cache.remove(&baileys_core::jid_normalized_user(jid)).await;
+        let sink = self.sink().await.ok_or(ClientError::ConnectionClosed)?;
+        self.assert_sessions(&[jid.to_string()], true, None, &sink).await?;
+        Ok(address)
+    }
+
+    /// Executa as ações do auto-heal (log em `[autoHeal]`, falha não propaga).
+    async fn run_heal_actions(&self, actions: Vec<HealAction>) {
+        for action in actions {
+            match action {
+                HealAction::GroupReset { group, users, threshold } => match self.reset_group_sender_key(&group).await {
+                    Ok(names) => tracing::warn!(
+                        group,
+                        users,
+                        threshold,
+                        sender_keys = names.len(),
+                        "[autoHeal] groupReset reason=retry"
+                    ),
+                    Err(e) => tracing::error!(group, error = %e, "[autoHeal] groupReset falhou"),
+                },
+                HealAction::SessionReset { jid, reason, count } => match self.reset_device_session(&jid).await {
+                    Ok(address) => tracing::warn!(jid, address, reason, count, "[autoHeal] sessionReset"),
+                    Err(e) => tracing::error!(jid, reason, error = %e, "[autoHeal] sessionReset falhou"),
+                },
+            }
+        }
     }
 
     /// Registra os callbacks de store de mensagens (port do `getMessage`/
@@ -2146,6 +2204,12 @@ impl Client {
                 }
             } else {
                 self.send_message_ack(node, sink).await?;
+                if is_session_decrypt_error(&stub) {
+                    if let Some(action) = self.auto_heal.note_decrypt_failure(&author, std::time::Instant::now()) {
+                        let client = self.clone();
+                        tokio::spawn(async move { client.run_heal_actions(vec![action]).await });
+                    }
+                }
                 let client = self.clone();
                 let sink = sink.clone();
                 let retry_node = node.clone();
@@ -3839,6 +3903,22 @@ impl Client {
             tracing::warn!(error = %e, msg_id, "retry: processamento falhou (ack enviado mesmo assim)");
         }
         self.send_message_ack(node, sink).await?;
+
+        let group_size = if baileys_core::is_jid_group(&from) {
+            self.group_meta_cache.get(&from).await.map(|m| m.size).unwrap_or(0)
+        } else {
+            0
+        };
+        let actions = self.auto_heal.note_retry(
+            &from,
+            participant.as_deref(),
+            &msg_id,
+            group_size,
+            std::time::Instant::now(),
+        );
+        if !actions.is_empty() {
+            self.run_heal_actions(actions).await;
+        }
         Ok(())
     }
 
@@ -3915,13 +3995,12 @@ impl Client {
             return Ok(());
         }
 
-        // `catch` do Node: `msgRetryCache.flushAll()`.
+        // Sem `clear()` no erro: zerar o cache inteiro reabre o retry de todo mundo.
         let result = self
             .resend_retry(node, sink, &msg_id, &remote, retry_participant)
             .await;
         if let Err(e) = &result {
             tracing::error!(msg_id, error = %e, "error in sending message again");
-            self.msg_retry_cache.clear().await;
         }
         result
     }
@@ -3950,8 +4029,16 @@ impl Client {
         retry_count += 1;
         self.msg_retry_cache.set(cache_key, retry_count).await;
 
+        // Só o device que pediu retry sai do mapa; remover o grupo inteiro
+        // redistribui a sender key para todos a cada retry.
         if baileys_core::is_jid_group(&remote) {
-            self.sender_key_memory.remove(&remote).await;
+            if let Some(participant) = retry_participant.as_deref() {
+                if let Some(mut memory) = self.sender_key_memory.get(&remote).await {
+                    if memory.remove(participant).is_some() {
+                        self.sender_key_memory.set(remote.clone(), memory).await;
+                    }
+                }
+            }
         }
 
         // Tenta extrair e injetar a sessão E2E do bundle `<keys>` do retry
