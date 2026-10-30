@@ -441,6 +441,8 @@ pub struct SendMessageResult {
 pub struct RelayParticipant {
     pub jid: String,
     pub count: u32,
+    /// `t` original da mensagem (do `<retry t>`), repetido no reenvio de grupo.
+    pub t: Option<String>,
 }
 
 /// Parâmetros configuráveis do retry manual (`/manager/retry`).
@@ -625,7 +627,7 @@ impl Client {
             qr_rotation: Mutex::new(None),
             qr_refs_ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             qr_close: Arc::new(tokio::sync::Notify::new()),
-            force_session_cache: TtlCache::new(Duration::from_secs(600), 2000),
+            force_session_cache: TtlCache::new(Duration::from_secs(3600), 50_000),
             retry_mutex: Mutex::new(()),
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000).with_flush_tracking(),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
@@ -4188,22 +4190,23 @@ impl Client {
             }
         }
 
-        // Sem bundle injetado → re-garante sessão com o participante.
-        // `force` segue o `forceSession` do Node: forçado na primeira vez,
-        // depois reusa.
-        //
-        // Node: `if (!injectedFromBundle && retryParticipantJid)` — para grupo
-        // sem participant, NÃO re-garante sessão (não há device alvo).
+        // Sem bundle injetado: política do whatsmeow (`shouldRecreateSession`).
+        // Recriar a sessão a cada retry troca a sessão de centenas de celulares
+        // por mensagem e o envio seguinte sai numa sessão que eles não têm. Só
+        // busca chaves novas sem sessão (assert sem force) ou com `count >= 2`,
+        // no máximo uma vez por hora por device (`force_session_cache`, 1h).
         if !injected_from_bundle {
             if let Some(retry_participant_jid) = retry_participant.as_deref() {
-                let force = {
-                    if self.force_session_cache.contains(retry_participant_jid).await {
-                        false
-                    } else {
-                        self.force_session_cache.set(retry_participant_jid.to_string(), ()).await;
-                        true
-                    }
-                };
+                let count_in_node = node
+                    .child("retry")
+                    .and_then(|r| r.attr("count"))
+                    .and_then(|c| c.parse::<u32>().ok())
+                    .unwrap_or(1);
+                let force = count_in_node >= 2
+                    && !self.force_session_cache.contains(retry_participant_jid).await;
+                if force {
+                    self.force_session_cache.set(retry_participant_jid.to_string(), ()).await;
+                }
                 let lids = self.node_get_lid(retry_participant_jid, sink).await?;
                 self.assert_sessions(&[retry_participant_jid.to_string()], force, lids.as_deref(), sink).await?;
             }
@@ -4253,6 +4256,7 @@ impl Client {
                 let relay_participant = RelayParticipant {
                     jid: retry_participant_jid.to_string(),
                     count: retry_count.max(1),
+                    t: node.child("retry").and_then(|r| r.attr("t")).map(String::from),
                 };
                 if baileys_core::is_jid_group(&target_jid) {
                     self.relay_group_message_retry(
@@ -5356,19 +5360,14 @@ impl Client {
         let patched = self.patch_message(&message);
 
         if let Some(participant) = participant {
-            // Node: encryptGroupMessage({ group: destinationJid, data: bytes, meId: meLid }).
-            let enc = repo.encrypt_group_message(
-                jid,
-                &me_lid,
-                &write_random_pad_max16(&patched.encode_to_vec()),
-            )?;
+            // Só o SKDM (whatsmeow `builder.Create`): `encrypt_group_message`
+            // cifraria e descartaria uma mensagem, avançando a cadeia a cada retry.
+            let skdm = repo.sender_key_distribution(jid, &me_lid)?;
             let message_to_send = {
                 let mut patched = patched.clone();
                 patched.sender_key_distribution_message =
                     Some(wa::message::SenderKeyDistributionMessage {
-                        axolotl_sender_key_distribution_message: Some(
-                            enc.sender_key_distribution_message.clone(),
-                        ),
+                        axolotl_sender_key_distribution_message: Some(skdm),
                         group_id: Some(jid.to_string()),
                     });
                 patched
@@ -5386,18 +5385,21 @@ impl Client {
 
             // Node linha 654: `stanza.attrs.to = destinationJid` +
             // `stanza.attrs.participant = participant.jid`.
+            // whatsmeow/zapo: `addressing_mode` pelo servidor de quem pediu,
+            // `t` original e sem `peer_recipient_lid` (só existe em 1:1).
+            let retry_addressing = if baileys_core::is_lid_user(&participant.jid) { "lid" } else { "pn" };
             let mut stanza = BinaryNode::new("message")
                 .with_attr("id", msg_id)
                 .with_attr("type", get_message_type(&message))
-                .with_attr("addressing_mode", addressing_mode);
+                .with_attr("addressing_mode", retry_addressing);
             for &(k, v) in extra_attrs {
                 stanza = stanza.with_attr(k, v);
             }
             stanza = stanza
                 .with_attr("to", jid)
                 .with_attr("participant", &participant.jid);
-            if let Some(lid) = &lid {
-                stanza = stanza.with_attr("peer_recipient_lid", lid);
+            if let Some(t) = &participant.t {
+                stanza = stanza.with_attr("t", t);
             }
             let stanza = stanza.with_children(children);
 
