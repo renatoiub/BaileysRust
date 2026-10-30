@@ -311,6 +311,23 @@ fn call_status_from_node(node: &BinaryNode) -> &'static str {
 /// `NO_MESSAGE_FOUND_ERROR_TEXT` do Hineken.
 const NO_MESSAGE_FOUND_ERROR_TEXT: &str = "Message absent from node";
 
+/// `RETRY_DEDUPE_S` (padrão 300): janela em que o mesmo `msgId:device` não é reenviado de novo.
+fn retry_dedupe_s() -> u64 {
+    std::env::var("RETRY_DEDUPE_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(300)
+}
+
+/// `RETRY_MSG_BUDGET` (padrão 0 = sem teto): total de reenvios por `msgId`.
+fn retry_msg_budget() -> u32 {
+    std::env::var("RETRY_MSG_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// `RETRY_MAX_AGE_S` (padrão 900, mínimo 60): retry de mensagem mais antiga é ignorado.
 fn retry_max_age_s() -> u64 {
     std::env::var("RETRY_MAX_AGE_S")
@@ -542,6 +559,10 @@ pub struct Client {
     msg_retry_cache: TtlCache<u32>,
     /// `placeholderResendCache` — evita PDOs duplicados para o mesmo msg id.
     placeholder_resend_cache: TtlCache<()>,
+    /// `msgId:device` já reenviado (TTL `RETRY_DEDUPE_S`): retry repetido só leva ack.
+    resend_dedupe: TtlCache<()>,
+    /// Total de reenvios por `msgId` (teto opcional `RETRY_MSG_BUDGET`).
+    resend_budget: TtlCache<u32>,
     /// `lidCache` — mapeia `@s.whatsapp.net` → `@lid` (evita USync repetido).
     lid_cache: TtlCache<String>,
     /// `devicesCache` — fanout de devices por JID (evita USync repetido).
@@ -608,6 +629,8 @@ impl Client {
             retry_mutex: Mutex::new(()),
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000).with_flush_tracking(),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
+            resend_dedupe: TtlCache::new(Duration::from_secs(retry_dedupe_s()), 200_000),
+            resend_budget: TtlCache::new(Duration::from_secs(3600), 50_000),
             lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             devices_cache: TtlCache::new(Duration::from_secs(1000), 2000),
             on_whatsapp_cache: TtlCache::new(Duration::from_secs(7200), 1000),
@@ -4007,6 +4030,23 @@ impl Client {
             return Ok(());
         }
 
+        // O mesmo device pedindo retry da mesma mensagem logo após o reenvio
+        // entra em loop: dentro de `RETRY_DEDUPE_S` só leva o ack.
+        let dedupe_key = format!("{msg_id}:{}", participant.clone().unwrap_or_else(|| from.clone()));
+        if self.resend_dedupe.get(&dedupe_key).await.is_some() {
+            tracing::debug!(dedupe_key, "retry ignored, resent recently");
+            return Ok(());
+        }
+        let budget = retry_msg_budget();
+        let resent_for_msg = self.resend_budget.get(&msg_id).await.unwrap_or(0);
+        if budget > 0 && resent_for_msg >= budget {
+            if resent_for_msg == budget {
+                self.resend_budget.set(msg_id.clone(), resent_for_msg + 1).await;
+                tracing::error!(msg_id, sent = resent_for_msg, "[retryBudget]");
+            }
+            return Ok(());
+        }
+
         // `key.participant = key.participant || attrs.from` +
         // `willSendMessageAgain(ids[0], key.participant)`.
         let will_key = format!("{msg_id}:{}", participant.clone().unwrap_or_else(|| from.clone()));
@@ -4024,8 +4064,13 @@ impl Client {
         let result = self
             .resend_retry(node, sink, &msg_id, &remote, retry_participant)
             .await;
-        if let Err(e) = &result {
-            tracing::error!(msg_id, error = %e, "error in sending message again");
+        match &result {
+            Ok(()) => {
+                self.resend_dedupe.set(dedupe_key, ()).await;
+                let sent = self.resend_budget.get(&msg_id).await.unwrap_or(0);
+                self.resend_budget.set(msg_id.clone(), sent + 1).await;
+            }
+            Err(e) => tracing::error!(msg_id, error = %e, "error in sending message again"),
         }
         result
     }

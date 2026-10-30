@@ -16,10 +16,11 @@ use std::time::{Duration, Instant};
 pub struct AutoHealConfig {
     pub enabled: bool,
     /// Percentual dos participantes que precisa pedir retry para trocar a sender key.
+    /// Sender key corrompida faz quase todos falharem; falha parcial o retry cura.
     pub group_pct: f64,
     pub group_min: usize,
     pub group_max: usize,
-    /// Limite quando o tamanho do grupo não é conhecido.
+    /// Limite quando o tamanho do grupo não é conhecido (`usize::MAX` = nunca).
     pub group_default: usize,
     pub group_window: Duration,
     pub group_cooldown: Duration,
@@ -36,10 +37,10 @@ impl Default for AutoHealConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            group_pct: 5.0,
+            group_pct: 50.0,
             group_min: 3,
-            group_max: 20,
-            group_default: 5,
+            group_max: usize::MAX,
+            group_default: usize::MAX,
             group_window: Duration::from_secs(10 * 60),
             group_cooldown: Duration::from_secs(60 * 60),
             device_retries: 3,
@@ -222,10 +223,10 @@ mod tests {
     #[test]
     fn group_threshold_is_proportional_and_clamped() {
         let cfg = AutoHealConfig::default();
-        assert_eq!(cfg.group_threshold(0), 5);
-        assert_eq!(cfg.group_threshold(10), 3);
-        assert_eq!(cfg.group_threshold(200), 10);
-        assert_eq!(cfg.group_threshold(1000), 20);
+        assert_eq!(cfg.group_threshold(0), usize::MAX);
+        assert_eq!(cfg.group_threshold(4), 3);
+        assert_eq!(cfg.group_threshold(10), 5);
+        assert_eq!(cfg.group_threshold(785), 393);
     }
 
     #[test]
@@ -269,15 +270,31 @@ mod tests {
     fn group_reset_counts_distinct_users_not_devices() {
         let heal = AutoHeal::new(AutoHealConfig::default());
         let now = Instant::now();
-        // Grupo de 60 → limite 3. Dois devices do mesmo usuário contam como um.
-        assert!(heal.note_retry(GROUP, Some("111:1@lid"), "M1", 60, now).iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
-        assert!(heal.note_retry(GROUP, Some("111:2@lid"), "M1", 60, now).iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
-        assert!(heal.note_retry(GROUP, Some("222@lid"), "M1", 60, now).iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
-        let actions = heal.note_retry(GROUP, Some("333@lid"), "M1", 60, now);
+        // Grupo de 6 → limite 3. Dois devices do mesmo usuário contam como um.
+        assert!(heal.note_retry(GROUP, Some("111:1@lid"), "M1", 6, now).iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
+        assert!(heal.note_retry(GROUP, Some("111:2@lid"), "M1", 6, now).iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
+        assert!(heal.note_retry(GROUP, Some("222@lid"), "M1", 6, now).iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
+        let actions = heal.note_retry(GROUP, Some("333@lid"), "M1", 6, now);
         assert!(actions.contains(&HealAction::GroupReset { group: GROUP.to_string(), users: 3, threshold: 3 }));
         // Cooldown: outro pico logo depois não dispara de novo.
         for user in ["444@lid", "555@lid", "666@lid", "777@lid"] {
-            let actions = heal.note_retry(GROUP, Some(user), "M2", 60, now);
+            let actions = heal.note_retry(GROUP, Some(user), "M2", 6, now);
+            assert!(actions.iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
+        }
+    }
+
+    #[test]
+    fn partial_failure_in_large_group_does_not_reset() {
+        let heal = AutoHeal::new(AutoHealConfig::default());
+        let now = Instant::now();
+        // 257 de 785 (o caso do gmp3) não é sender key quebrada.
+        for i in 0..257 {
+            let actions = heal.note_retry(GROUP, Some(&format!("{i}@lid")), "M1", 785, now);
+            assert!(actions.iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
+        }
+        // Tamanho desconhecido: nunca reseta.
+        for i in 0..50 {
+            let actions = heal.note_retry("1@g.us", Some(&format!("{i}@lid")), "M1", 0, now);
             assert!(actions.iter().all(|a| !matches!(a, HealAction::GroupReset { .. })));
         }
     }
