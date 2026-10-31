@@ -10,6 +10,10 @@
 //! - **Escrita**: extensão primeiro; se retornar `false`, cai no SQLite.
 //! - **Remoção**: extensão primeiro; se retornar `false`, cai no SQLite.
 //!
+//! Se a extensão desligar o fallback ([`SignalStoreExtension::sqlite_fallback`]),
+//! o SQLite não é lido nem gravado para chaves de sinal: miss é miss e falha
+//! do backend vira erro.
+//!
 //! Sem extensão configurada (ex. testes), lê/grava direto no SQLite.
 //!
 //! Chaves usadas:
@@ -47,6 +51,14 @@ pub trait SignalStoreExtension: Send + Sync {
     fn store(&self, category: &str, id: &str, json: &str) -> bool;
     /// Remove a chave. `true` = backend tratou; `false` = cai no SQLite.
     fn remove(&self, category: &str, id: &str) -> bool;
+    /// `false` = o backend é a única fonte das chaves de sinal (sem SQLite).
+    fn sqlite_fallback(&self) -> bool {
+        true
+    }
+    /// Como `load`, mas distingue falha do backend (`Err`) de miss (`Ok(None)`).
+    fn try_load(&self, category: &str, id: &str) -> std::result::Result<Option<String>, String> {
+        Ok(self.load(category, id))
+    }
 }
 
 /// Store de sinal apoiado pelo SQLite (`auth_data`), com extensão opcional.
@@ -105,6 +117,9 @@ impl SqliteSignalStore {
     pub fn load_generic(&self, category: &str, id: &str) -> Option<String> {
         let ext = self.extension();
         if let Some(ext) = ext {
+            if !ext.sqlite_fallback() {
+                return ext.try_load(category, id).ok().flatten();
+            }
             if let Some(raw) = ext.load(category, id) {
                 return Some(raw);
             }
@@ -128,7 +143,7 @@ impl SqliteSignalStore {
     pub fn store_generic(&self, category: &str, id: &str, json: &str) {
         let ext = self.extension();
         if let Some(ext) = ext {
-            if ext.store(category, id, json) {
+            if ext.store(category, id, json) || !ext.sqlite_fallback() {
                 return;
             }
         }
@@ -140,7 +155,7 @@ impl SqliteSignalStore {
     pub fn remove_generic(&self, category: &str, id: &str) {
         let ext = self.extension();
         if let Some(ext) = ext {
-            if ext.remove(category, id) {
+            if ext.remove(category, id) || !ext.sqlite_fallback() {
                 return;
             }
         }
@@ -154,6 +169,18 @@ impl SqliteSignalStore {
 
     fn parse_err(e: impl std::fmt::Display) -> baileys_signal::error::SignalError {
         baileys_signal::error::SignalError::Store(e.to_string())
+    }
+
+    fn backend_err(op: &str, category: &str, id: &str, detail: &str) -> baileys_signal::error::SignalError {
+        baileys_signal::error::SignalError::Store(format!(
+            "[auth-keys] {op} {category}-{id} no backend falhou (sem fallback SQLite): {detail}"
+        ))
+    }
+
+    /// Leitura só no backend (fallback desligado): falha vira erro, miss é `None`.
+    fn load_backend_only(ext: &Arc<dyn SignalStoreExtension>, category: &str, id: &str) -> Result<Option<String>> {
+        ext.try_load(category, id)
+            .map_err(|e| Self::backend_err("leitura", category, id, &e))
     }
 
     fn read_buffer(value: &BufferValue) -> Vec<u8> {
@@ -175,6 +202,9 @@ impl SqliteSignalStore {
             if ext.store("pre-key", &id.to_string(), &json) {
                 return Ok(());
             }
+            if !ext.sqlite_fallback() {
+                return Err(Self::backend_err("gravação", "pre-key", &id.to_string(), "store recusado"));
+            }
             self.sqlite
                 .write_string(&key, &json)
                 .map_err(Self::sqlite_err)?;
@@ -191,6 +221,12 @@ impl SignalStore for SqliteSignalStore {
     fn load_session(&self, id: &str) -> Result<Option<SessionRecord>> {
         let key = format!("session-{id}");
         if let Some(ext) = self.extension() {
+            if !ext.sqlite_fallback() {
+                return match Self::load_backend_only(&ext, "session", id)? {
+                    Some(raw) => serde_json::from_str(&raw).map(Some).map_err(Self::parse_err),
+                    None => Ok(None),
+                };
+            }
             if let Some(raw) = ext.load("session", id) {
                 return serde_json::from_str(&raw).map(Some).map_err(Self::parse_err);
             }
@@ -214,6 +250,9 @@ impl SignalStore for SqliteSignalStore {
             if ext.store("session", id, &json) {
                 return Ok(());
             }
+            if !ext.sqlite_fallback() {
+                return Err(Self::backend_err("gravação", "session", id, "store recusado"));
+            }
             self.sqlite
                 .write_string(&key, &json)
                 .map_err(Self::sqlite_err)?;
@@ -228,6 +267,17 @@ impl SignalStore for SqliteSignalStore {
     fn load_pre_key(&self, id: u32) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let key = format!("pre-key-{id}");
         if let Some(ext) = self.extension() {
+            if !ext.sqlite_fallback() {
+                let Some(raw) = Self::load_backend_only(&ext, "pre-key", &id.to_string())? else {
+                    return Ok(None);
+                };
+                let kp: SerializedKeyPair =
+                    serde_json::from_str(&raw).map_err(Self::parse_err)?;
+                return Ok(Some((
+                    Self::read_buffer(&kp.public),
+                    Self::read_buffer(&kp.private),
+                )));
+            }
             if let Some(raw) = ext.load("pre-key", &id.to_string()) {
                 let kp: SerializedKeyPair =
                     serde_json::from_str(&raw).map_err(Self::parse_err)?;
@@ -264,6 +314,9 @@ impl SignalStore for SqliteSignalStore {
             if ext.remove("pre-key", &id.to_string()) {
                 return Ok(());
             }
+            if !ext.sqlite_fallback() {
+                return Err(Self::backend_err("remoção", "pre-key", &id.to_string(), "remove recusado"));
+            }
             self.sqlite.remove(&key).map_err(Self::sqlite_err)?;
             return Ok(());
         }
@@ -296,6 +349,14 @@ impl SignalStore for SqliteSignalStore {
     fn load_sender_key(&self, name: &SenderKeyName) -> Result<SenderKeyRecord> {
         let key = format!("sender-key-{}", name.to_string());
         if let Some(ext) = self.extension() {
+            if !ext.sqlite_fallback() {
+                let Some(raw) = Self::load_backend_only(&ext, "sender-key", &name.to_string())? else {
+                    return Ok(SenderKeyRecord::default());
+                };
+                let value: BufferValue =
+                    serde_json::from_str(&raw).map_err(Self::parse_err)?;
+                return SenderKeyRecord::deserialize(&Self::read_buffer(&value));
+            }
             if let Some(raw) = ext.load("sender-key", &name.to_string()) {
                 let value: BufferValue =
                     serde_json::from_str(&raw).map_err(Self::parse_err)?;
@@ -334,6 +395,9 @@ impl SignalStore for SqliteSignalStore {
             // (BufferJSON → `{"type":"Buffer","data":"<base64>"}`).
             if ext.store("sender-key", &name.to_string(), &value_json) {
                 return Ok(());
+            }
+            if !ext.sqlite_fallback() {
+                return Err(Self::backend_err("gravação", "sender-key", &name.to_string(), "store recusado"));
             }
             self.sqlite
                 .write_value(&key, &value)
