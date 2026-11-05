@@ -1201,6 +1201,16 @@ impl Client {
             return Ok(());
         }
 
+        // `CB:status` — stories entregues como nó top-level `<status>` (skmsg
+        // de `status@broadcast`). Sem handler + ack, o servidor derruba a
+        // conexão com `stream:error { ack class="status" }` (Baileys #2858).
+        if tag == "status" {
+            if let Err(e) = self.handle_status(node, sink).await {
+                tracing::warn!(error = %e, "erro ao processar status (não fatal)");
+            }
+            return Ok(());
+        }
+
         // Notificação de pre-keys baixas.
         if tag == "notification" || (tag == "iq" && node.attr("xmlns") == Some("encrypt")) {
             // Se for a notificação `count` (pre-keys baixas), o upload roda em
@@ -2222,6 +2232,54 @@ impl Client {
         self.process_message(&info, &key_extras, sink).await;
         self.maybe_sync_app_state(&info, sink);
         Ok(())
+    }
+
+    /// `handleStatus` (Hineken `messages-recv.ts`): o WhatsApp passou a
+    /// entregar stories como nó top-level `<status>` (skmsg de
+    /// `status@broadcast`) em vez de `<message>`. Decripta, faz o upsert
+    /// (evento `Message`, igual ao `handleMessage`) e envia o ack
+    /// `class="status"` — sem ack o servidor derruba a conexão.
+    async fn handle_status(
+        self: &Arc<Self>,
+        node: &BinaryNode,
+        sink: &WsSink,
+    ) -> Result<(), ClientError> {
+        let from = node.attr("from").unwrap_or_default().to_string();
+
+        // `shouldIgnoreJid` (ack e sai).
+        if self.should_ignore_jid(&from) && from != "@s.whatsapp.net" {
+            tracing::debug!(from = %from, "ignored status");
+            return self.send_message_ack(node, sink).await;
+        }
+
+        // Sem `<enc>` não há o que decriptar — ack e sai.
+        if node.child("enc").is_none() {
+            return self.send_message_ack(node, sink).await;
+        }
+
+        // `decodeMessageNode` lança em envelope inválido (o Node faz ack).
+        let Some(decoded) = self.decode_message_node(node) else {
+            tracing::warn!(from = %from, "status: envelope inválido, ignorado");
+            return self.send_message_ack(node, sink).await;
+        };
+        let DecodedMessageNode { full: mut info, author, sender, key_extras, .. } = decoded;
+
+        self.decrypt_message_node(node, &mut info, &author, &sender);
+
+        // `cleanMessage` + `upsertMessage` (→ `processMessage`).
+        clean_message(&mut info, &self.me_id());
+        let _ = self.events.send(ClientEvent::Message {
+            info: info.clone(),
+            raw: node.clone(),
+            key_extras: key_extras.clone(),
+        });
+        self.update_push_name_from_message(&info, sink).await;
+        tracing::debug!(from = %from, "evento Message (status) emitido");
+
+        self.process_message(&info, &key_extras, sink).await;
+        self.maybe_sync_app_state(&info, sink);
+
+        self.send_message_ack(node, sink).await
     }
 
     /// Gatilhos do `upsertMessage`: history sync com `myAppStateKeyId` →
