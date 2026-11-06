@@ -2552,6 +2552,18 @@ impl Client {
                     ..Default::default()
                 }],
             });
+        } else if let Some(contact) = &action.lid_contact_action {
+            // Aparelhos que gravam contato só com LID (tag 61 do proto);
+            // o Node atual não trata, mas o proto expõe.
+            let _ = self.events.send(ClientEvent::ContactsUpsert {
+                contacts: vec![ContactUpsert {
+                    id: id.clone(),
+                    name: contact.full_name.clone(),
+                    lid: is_lid_user(&id).then(|| id.clone()),
+                    jid: is_jid_user(&id).then(|| id.clone()),
+                    ..Default::default()
+                }],
+            });
         } else if let Some(push_name) = &action.push_name_setting {
             if let Some(name) = push_name.name.as_deref().filter(|n| !n.is_empty()) {
                 self.set_me_name(name, sink).await;
@@ -2961,6 +2973,12 @@ impl Client {
         let target_id = protocol.key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default();
 
         if r#type == Type::HistorySyncNotification as i32 {
+            // Paridade `shouldSyncHistoryMessage: () => false` do Node: quando
+            // `syncFullHistory` está desligado, ignora o histórico na origem
+            // (nem baixa).
+            if !self.config.sync_full_history {
+                return;
+            }
             // Download HTTP fora do loop de leitura.
             if let Some(notification) = protocol.history_sync_notification.clone() {
                 let client = self.clone();
@@ -3208,6 +3226,59 @@ impl Client {
                 );
             }
 
+            // `processHistoryMessage`: `lidCache` a partir de
+            // `phoneNumberToLidMappings` (`pnJid` → `lidJid`), normalizando
+            // com `jid_normalized_user` (consistente com `get_lid`).
+            for m in &h.phone_number_to_lid_mappings {
+                if let (Some(pn), Some(lid)) = (m.pn_jid.as_deref(), m.lid_jid.as_deref()) {
+                    let pn = baileys_core::jid_normalized_user(pn);
+                    if pn.is_empty() {
+                        continue;
+                    }
+                    let lid = baileys_core::jid_normalized_user(lid);
+                    if lid.is_empty() {
+                        continue;
+                    }
+                    if self.lid_cache.get(&pn).await.is_none() {
+                        self.lid_cache.set(pn, lid).await;
+                    }
+                }
+            }
+
+            // `processHistoryMessage`: extrai `contacts` por `syncType`, com
+            // os mesmos critérios do Node (`history.js`).
+            //
+            // - Bootstrap/recent/full/on-demand: conversas (`id`, `name`,
+            //   `lid`, `jid` quando `isJidUser`).
+            // - PushName: `{ id, notify }`.
+            let contacts: Vec<serde_json::Value> = match sync_type {
+                0 | 2 | 3 | 6 => h
+                    .conversations
+                    .iter()
+                    .map(|chat| {
+                        serde_json::json!({
+                            "id": chat.id,
+                            "name": chat.display_name.as_deref()
+                                .or(chat.name.as_deref())
+                                .or(chat.username.as_deref()),
+                            "lid": chat.lid_jid,
+                            "jid": chat.id.as_deref().filter(|id| is_jid_user(id)),
+                        })
+                    })
+                    .collect(),
+                4 => h
+                    .pushnames
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "id": p.id,
+                            "notify": p.pushname,
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+
             // `messages` extraído direto (sem reter `Conversation`
             // completo: o consumidor só usa `data.messages`).
             let messages: Vec<wa::WebMessageInfo> = h
@@ -3215,16 +3286,6 @@ impl Client {
                 .into_iter()
                 .flat_map(|c| c.messages)
                 .filter_map(|m| m.message)
-                .collect();
-            let contacts: Vec<serde_json::Value> = h
-                .pushnames
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "id": p.id,
-                        "pushName": p.pushname,
-                    })
-                })
                 .collect();
             let _ = self.events.send(ClientEvent::MessagingHistorySet {
                 data: MessagingHistorySet {
