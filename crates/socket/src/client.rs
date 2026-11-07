@@ -3246,23 +3246,62 @@ impl Client {
             }
 
             // `processHistoryMessage`: extrai `contacts` por `syncType`, com
-            // os mesmos critérios do Node (`history.js`).
+            // os mesmos critérios do Node (`history.js`), MAS resolvendo o PN
+            // quando a conversa vem com `id` = LID (device duplicado/linked).
             //
             // - Bootstrap/recent/full/on-demand: conversas (`id`, `name`,
             //   `lid`, `jid` quando `isJidUser`).
             // - PushName: `{ id, notify }`.
+            //
+            // Mapa inverso LID → PN a partir de `phoneNumberToLidMappings`
+            // (o `lidCache` só resolve PN → LID; aqui precisamos do reverso).
+            let mut lid_to_pn: HashMap<String, String> = HashMap::new();
+            for m in &h.phone_number_to_lid_mappings {
+                if let (Some(pn), Some(lid)) = (m.pn_jid.as_deref(), m.lid_jid.as_deref()) {
+                    let pn = baileys_core::jid_normalized_user(pn);
+                    let lid = baileys_core::jid_normalized_user(lid);
+                    if !pn.is_empty() && !lid.is_empty() {
+                        lid_to_pn.entry(lid).or_insert(pn);
+                    }
+                }
+            }
+
             let contacts: Vec<serde_json::Value> = match sync_type {
                 0 | 2 | 3 | 6 => h
                     .conversations
                     .iter()
                     .map(|chat| {
+                        // PN em ordem de preferência: `pnJid` (campo 39) →
+                        // `id` quando é PN → mapa inverso `LID → PN`.
+                        let jid = chat
+                            .pn_jid
+                            .as_deref()
+                            .filter(|j| is_jid_user(j))
+                            .map(String::from)
+                            .or_else(|| {
+                                chat.id
+                                    .as_deref()
+                                    .filter(|id| is_jid_user(id))
+                                    .map(String::from)
+                            })
+                            .or_else(|| {
+                                let key = chat
+                                    .lid_jid
+                                    .as_deref()
+                                    .filter(|l| !l.is_empty())
+                                    .or(chat.id.as_deref())
+                                    .unwrap_or_default();
+                                lid_to_pn
+                                    .get(&baileys_core::jid_normalized_user(key))
+                                    .cloned()
+                            });
                         serde_json::json!({
                             "id": chat.id,
                             "name": chat.display_name.as_deref()
                                 .or(chat.name.as_deref())
                                 .or(chat.username.as_deref()),
                             "lid": chat.lid_jid,
-                            "jid": chat.id.as_deref().filter(|id| is_jid_user(id)),
+                            "jid": jid,
                         })
                     })
                     .collect(),
