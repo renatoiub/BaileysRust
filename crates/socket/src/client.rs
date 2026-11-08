@@ -534,6 +534,10 @@ pub struct Client {
     placeholder_resend_cache: TtlCache<()>,
     /// `lidCache` — mapeia `@s.whatsapp.net` → `@lid` (evita USync repetido).
     lid_cache: TtlCache<String>,
+    /// `pnOfLidCache` — mapeia `@lid` → `@s.whatsapp.net` (inverso do lidCache),
+    /// alimentado pelo `phoneNumberToLidMappings` do history sync e usado para
+    /// resolver PN de pushnames/conversas que só trazem LID.
+    pn_of_lid_cache: TtlCache<String>,
     /// `devicesCache` — fanout de devices por JID (evita USync repetido).
     devices_cache: TtlCache<Vec<(String, u32, String)>>,
     /// `onWhatsapp` — existência no WhatsApp por JID.
@@ -596,6 +600,7 @@ impl Client {
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000).with_flush_tracking(),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
+            pn_of_lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             devices_cache: TtlCache::new(Duration::from_secs(1000), 2000),
             on_whatsapp_cache: TtlCache::new(Duration::from_secs(7200), 1000),
             sender_key_memory: TtlCache::new(Duration::from_secs(86400), 2000),
@@ -624,6 +629,7 @@ impl Client {
     fn apply_cache_config(&self) {
         let enabled = self.config.cache_control;
         self.lid_cache.set_enabled(enabled);
+        self.pn_of_lid_cache.set_enabled(enabled);
         self.devices_cache.set_enabled(enabled);
         self.on_whatsapp_cache.set_enabled(enabled);
         self.profile_picture_cache.set_enabled(enabled);
@@ -633,6 +639,7 @@ impl Client {
             return;
         };
         self.lid_cache.set_backend("cache:global:lid", Some(provider.clone()));
+        self.pn_of_lid_cache.set_backend("cache:global:pn_of_lid", Some(provider.clone()));
         self.devices_cache.set_backend("cache:global:devices", Some(provider.clone()));
         self.on_whatsapp_cache.set_backend("cache:global:onwhatsapp", Some(provider.clone()));
         self.profile_picture_cache.set_backend("cache:global:profilepic", Some(provider.clone()));
@@ -3229,6 +3236,8 @@ impl Client {
             // `processHistoryMessage`: `lidCache` a partir de
             // `phoneNumberToLidMappings` (`pnJid` → `lidJid`), normalizando
             // com `jid_normalized_user` (consistente com `get_lid`).
+            // Alimenta também o inverso (`pnOfLidCache`, LID → PN) para
+            // resolver pushnames/conversas que só trazem `@lid`.
             for m in &h.phone_number_to_lid_mappings {
                 if let (Some(pn), Some(lid)) = (m.pn_jid.as_deref(), m.lid_jid.as_deref()) {
                     let pn = baileys_core::jid_normalized_user(pn);
@@ -3240,7 +3249,10 @@ impl Client {
                         continue;
                     }
                     if self.lid_cache.get(&pn).await.is_none() {
-                        self.lid_cache.set(pn, lid).await;
+                        self.lid_cache.set(pn.clone(), lid.clone()).await;
+                    }
+                    if self.pn_of_lid_cache.get(&lid).await.is_none() {
+                        self.pn_of_lid_cache.set(lid, pn).await;
                     }
                 }
             }
@@ -3251,10 +3263,11 @@ impl Client {
             //
             // - Bootstrap/recent/full/on-demand: conversas (`id`, `name`,
             //   `lid`, `jid` quando `isJidUser`).
-            // - PushName: `{ id, notify }`.
+            // - PushName: `{ id, notify, jid }` com PN resolvido quando
+            //   `id` é `@lid`.
             //
-            // Mapa inverso LID → PN a partir de `phoneNumberToLidMappings`
-            // (o `lidCache` só resolve PN → LID; aqui precisamos do reverso).
+            // Mapa inverso LID → PN do chunk (fallback: cache persistente
+            // `pn_of_lid_cache` para chunks que não trazem os mappings juntos).
             let mut lid_to_pn: HashMap<String, String> = HashMap::new();
             for m in &h.phone_number_to_lid_mappings {
                 if let (Some(pn), Some(lid)) = (m.pn_jid.as_deref(), m.lid_jid.as_deref()) {
@@ -3266,13 +3279,24 @@ impl Client {
                 }
             }
 
+            let resolve_pn = |lid_key: &str, cache: &HashMap<String, String>| -> Option<String> {
+                cache.get(lid_key).cloned()
+            };
+
             let contacts: Vec<serde_json::Value> = match sync_type {
-                0 | 2 | 3 | 6 => h
-                    .conversations
-                    .iter()
-                    .map(|chat| {
+                0 | 2 | 3 | 6 => {
+                    let mut out = Vec::with_capacity(h.conversations.len());
+                    for chat in &h.conversations {
                         // PN em ordem de preferência: `pnJid` (campo 39) →
-                        // `id` quando é PN → mapa inverso `LID → PN`.
+                        // `id` quando é PN → mapa inverso `LID → PN` do chunk
+                        // → cache persistente `pn_of_lid_cache`.
+                        let lid_key = chat
+                            .lid_jid
+                            .as_deref()
+                            .filter(|l| !l.is_empty())
+                            .or(chat.id.as_deref())
+                            .map(baileys_core::jid_normalized_user)
+                            .unwrap_or_default();
                         let jid = chat
                             .pn_jid
                             .as_deref()
@@ -3284,37 +3308,46 @@ impl Client {
                                     .filter(|id| is_jid_user(id))
                                     .map(String::from)
                             })
-                            .or_else(|| {
-                                let key = chat
-                                    .lid_jid
-                                    .as_deref()
-                                    .filter(|l| !l.is_empty())
-                                    .or(chat.id.as_deref())
-                                    .unwrap_or_default();
-                                lid_to_pn
-                                    .get(&baileys_core::jid_normalized_user(key))
-                                    .cloned()
-                            });
-                        serde_json::json!({
+                            .or_else(|| resolve_pn(&lid_key, &lid_to_pn));
+                        let jid = match jid {
+                            Some(j) => Some(j),
+                            None if !lid_key.is_empty() => self.pn_of_lid_cache.get(&lid_key).await,
+                            None => None,
+                        };
+                        out.push(serde_json::json!({
                             "id": chat.id,
                             "name": chat.display_name.as_deref()
                                 .or(chat.name.as_deref())
                                 .or(chat.username.as_deref()),
                             "lid": chat.lid_jid,
                             "jid": jid,
-                        })
-                    })
-                    .collect(),
-                4 => h
-                    .pushnames
-                    .iter()
-                    .map(|p| {
-                        serde_json::json!({
-                            "id": p.id,
+                        }));
+                    }
+                    out
+                }
+                4 => {
+                    let mut out = Vec::with_capacity(h.pushnames.len());
+                    for p in &h.pushnames {
+                        let id = p.id.as_deref().unwrap_or_default().to_string();
+                        let lid_key = baileys_core::jid_normalized_user(&id);
+                        let jid = if baileys_core::is_jid_user(&id) {
+                            Some(id.clone())
+                        } else if baileys_core::is_lid_user(&id) && !lid_key.is_empty() {
+                            match resolve_pn(&lid_key, &lid_to_pn) {
+                                Some(pn) => Some(pn),
+                                None => self.pn_of_lid_cache.get(&lid_key).await,
+                            }
+                        } else {
+                            None
+                        };
+                        out.push(serde_json::json!({
+                            "id": id,
                             "notify": p.pushname,
-                        })
-                    })
-                    .collect(),
+                            "jid": jid,
+                        }));
+                    }
+                    out
+                }
                 _ => Vec::new(),
             };
 
