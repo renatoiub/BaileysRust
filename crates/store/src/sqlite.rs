@@ -124,10 +124,11 @@ impl SQLiteAuthState {
     }
 
     /// Remove chaves por padrão LIKE (usado para limpar sender-keys de sessão).
-    pub fn remove_by_pattern(&self, pattern: &str) -> Result<(), StoreError> {
+    /// Retorna o número de linhas removidas.
+    pub fn remove_by_pattern(&self, pattern: &str) -> Result<usize, StoreError> {
         let conn = self.conn.lock().expect("sqlite lock");
-        conn.execute("DELETE FROM auth_data WHERE key LIKE ?1", rusqlite::params![pattern])?;
-        Ok(())
+        let n = conn.execute("DELETE FROM auth_data WHERE key LIKE ?1", rusqlite::params![pattern])?;
+        Ok(n)
     }
 
     /// Lê as credenciais.
