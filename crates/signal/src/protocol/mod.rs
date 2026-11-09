@@ -53,6 +53,8 @@ pub trait SignalStore: Send + Sync {
     // Sender key store
     fn load_sender_key(&self, name: &SenderKeyName) -> Result<SenderKeyRecord>;
     fn store_sender_key(&self, name: &SenderKeyName, record: &SenderKeyRecord) -> Result<()>;
+    /// Remove a sender key record (auto-repair on `TooFarIntoFuture`/`OldCounter`).
+    fn remove_sender_key(&self, name: &SenderKeyName) -> Result<()>;
 }
 
 /// In-memory signal store (used in tests).
@@ -125,6 +127,10 @@ impl SignalStore for MemoryStore {
     }
     fn store_sender_key(&self, name: &SenderKeyName, record: &SenderKeyRecord) -> Result<()> {
         self.sender_keys.lock().unwrap().insert(name.to_string(), record.clone());
+        Ok(())
+    }
+    fn remove_sender_key(&self, name: &SenderKeyName) -> Result<()> {
+        self.sender_keys.lock().unwrap().remove(&name.to_string());
         Ok(())
     }
 }

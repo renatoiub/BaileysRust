@@ -26,6 +26,7 @@ use baileys_core::{BinaryContent, BinaryNode, S_WHATSAPP_NET};
 use baileys_crypto::Curve;
 use baileys_proto::proto as wa;
 use baileys_repository::{InjectPreKey, InjectSession, InjectSignedPreKey, SignalRepository, SignalStoreExtension, SqliteSignalStore};
+use baileys_signal::error::SignalError;
 use baileys_signal::protocol::SignalStore;
 use baileys_store::creds::AuthenticationCreds;
 use baileys_store::sqlite::SQLiteAuthState;
@@ -530,6 +531,10 @@ pub struct Client {
     retry_mutex: Mutex<()>,
     /// Contador de retries por mensagem (port de `caches.msgRetryCache`).
     msg_retry_cache: TtlCache<u32>,
+    /// Cooldown de retry por grupo — limita a rajada de reenvios de mensagens
+    /// históricas quando o container (re)conecta e o peer pede retry em massa.
+    /// Chave = JID do grupo (ou remoto 1:1), valor = nº de reenvios na janela.
+    retry_cooldown: TtlCache<u32>,
     /// `placeholderResendCache` — evita PDOs duplicados para o mesmo msg id.
     placeholder_resend_cache: TtlCache<()>,
     /// `lidCache` — mapeia `@s.whatsapp.net` → `@lid` (evita USync repetido).
@@ -598,6 +603,7 @@ impl Client {
             force_session_cache: TtlCache::new(Duration::from_secs(600), 2000),
             retry_mutex: Mutex::new(()),
             msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000).with_flush_tracking(),
+            retry_cooldown: TtlCache::new(Duration::from_secs(60), 5000),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             pn_of_lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
@@ -2742,9 +2748,34 @@ impl Client {
                 };
                 let decoded: Result<wa::Message, String> = (|| {
                     let buf = match e2e_type.as_str() {
-                        "skmsg" => repo
-                            .decrypt_group_message(sender, author, content)
-                            .map_err(|e| e.to_string())?,
+                        "skmsg" => {
+                            match repo.decrypt_group_message(sender, author, content) {
+                                Ok(buf) => buf,
+                                Err(e) => {
+                                    // Auto-repair de SenderKey: quando a chain
+                                    // diverge além do recuperável (ou não há
+                                    // registro), apaga o SenderKeyRecord do
+                                    // autor para que a próxima mensagem venha
+                                    // com `senderKeyDistributionMessage` e
+                                    // re-aprenda do zero — em vez de loop de
+                                    // retry (`skmsg over 2000 future`).
+                                    let needs_repair = matches!(
+                                        e,
+                                        SignalError::TooFarIntoFuture
+                                            | SignalError::OldCounter { .. }
+                                            | SignalError::NoSenderKeyRecord(_)
+                                    );
+                                    if needs_repair {
+                                        if let Err(r) = repo.remove_sender_key(sender, author) {
+                                            tracing::warn!(group = %sender, author = %author, error = %r, "autorepair: falha ao remover sender key");
+                                        } else {
+                                            tracing::info!(group = %sender, author = %author, error = %e, "autorepair: sender key removida para re-negociação");
+                                        }
+                                    }
+                                    return Err(e.to_string());
+                                }
+                            }
+                        }
                         "pkmsg" | "msg" => {
                             let user = if is_jid_user(sender) { sender } else { author };
                             repo.decrypt_message(user, &e2e_type, content).map_err(|e| e.to_string())?
@@ -4193,10 +4224,24 @@ impl Client {
         let msg_id = msg_id.to_string();
         let remote = remote.to_string();
 
+        // Anti-flood: limita reenvios em massa por grupo/remoto quando o
+        // container (re)conecta e o peer pede retry de centenas de mensagens
+        // históricas de uma vez. A janela é curta (60s); acima do limite o
+        // retry é dropado silenciosamente — o peer re-pede depois se ainda
+        // precisar, e o `msg_retry_cache` continua limitando por mensagem.
+        const RETRY_COOLDOWN_MAX_PER_WINDOW: u32 = 20;
+        let mut cooldown = self.retry_cooldown.get(&remote).await.unwrap_or(0);
+        if cooldown >= RETRY_COOLDOWN_MAX_PER_WINDOW {
+            tracing::debug!(msg_id, remote, cooldown, "retry dropado (cooldown de grupo)");
+            return Ok(());
+        }
+        cooldown += 1;
+        self.retry_cooldown.set(remote.clone(), cooldown).await;
+
         // Por participante (mesma chave do `will_key`): em grupo, cada device que
         // pede retry precisa do próprio reenvio + reparo de sessão.
         let cache_key = format!("{msg_id}:{}", node.attr("participant").unwrap_or(from.as_str()));
-        let mut retry_count = self.msg_retry_cache.get(&cache_key).await.unwrap_or(0);
+  4234|        let mut retry_count = self.msg_retry_cache.get(&cache_key).await.unwrap_or(0);
         if retry_count >= self.config.max_msg_retry_count {
             tracing::debug!(retry_count, cache_key, "reached retry limit, clearing");
             return Ok(());

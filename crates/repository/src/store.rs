@@ -427,4 +427,22 @@ impl SignalStore for SqliteSignalStore {
             .map_err(Self::sqlite_err)?;
         Ok(())
     }
+
+    fn remove_sender_key(&self, name: &SenderKeyName) -> Result<()> {
+        let key = format!("sender-key-{}", name.to_string());
+        if let Some(ext) = self.extension() {
+            // `keys.set({ 'sender-key': { [id]: null } })` — remove do backend
+            // e cai no SQLite só se o backend permitir fallback.
+            if ext.remove("sender-key", &name.to_string()) {
+                return Ok(());
+            }
+            if !ext.sqlite_fallback() {
+                return Err(Self::backend_err("remoção", "sender-key", &name.to_string(), "remove recusado"));
+            }
+            self.sqlite.remove(&key).map_err(Self::sqlite_err)?;
+            return Ok(());
+        }
+        self.sqlite.remove(&key).map_err(Self::sqlite_err)?;
+        Ok(())
+    }
 }

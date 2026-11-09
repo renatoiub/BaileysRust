@@ -114,6 +114,13 @@ impl<'a> SignalRepository<'a> {
         builder.process(&name, &message)
     }
 
+    /// `removeSenderKey` — apaga o SenderKeyRecord de um autor num grupo
+    /// (auto-repair de `skmsg` quando a chain diverge além do recuperável).
+    pub fn remove_sender_key(&self, group_id: &str, author_jid: &str) -> Result<()> {
+        let name = jid_to_signal_sender_key_name(group_id, author_jid);
+        self.store.remove_sender_key(&name)
+    }
+
     /// `encryptGroupMessage`
     pub fn encrypt_group_message(
         &self,
