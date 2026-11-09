@@ -33,6 +33,8 @@ pub trait SignalStore: Send + Sync {
     fn load_session(&self, id: &str) -> Result<Option<SessionRecord>>;
     /// Persist a session record.
     fn store_session(&self, id: &str, session: &SessionRecord) -> Result<()>;
+    /// Remove a session record (auto-repair on `bad MAC`/`invalid pre-key ID`).
+    fn remove_session(&self, id: &str) -> Result<()>;
     /// Always trusted in Baileys (identity trust handled by the app layer).
     fn is_trusted_identity(&self, _id: &str, _identity_key: &[u8]) -> bool {
         true
@@ -90,6 +92,10 @@ impl SignalStore for MemoryStore {
     }
     fn store_session(&self, id: &str, session: &SessionRecord) -> Result<()> {
         self.sessions.lock().unwrap().insert(id.to_string(), session.clone());
+        Ok(())
+    }
+    fn remove_session(&self, id: &str) -> Result<()> {
+        self.sessions.lock().unwrap().remove(id);
         Ok(())
     }
     fn load_pre_key(&self, id: u32) -> Result<Option<(Vec<u8>, Vec<u8>)>> {

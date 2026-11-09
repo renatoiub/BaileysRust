@@ -72,6 +72,12 @@ impl<'a> SignalRepository<'a> {
         }
     }
 
+    /// `removeSession` — apaga a sessão 1:1 de um jid (auto-repair).
+    pub fn remove_session(&self, jid: &str) -> Result<()> {
+        let addr = jid_to_signal_protocol_address(jid)?;
+        self.store.remove_session(&addr.to_string())
+    }
+
     /// `encryptMessage` — criptografa para um jid 1:1.
     pub fn encrypt_message(&self, jid: &str, data: &[u8]) -> Result<MessageEncryptResult> {
         let addr = jid_to_signal_protocol_address(jid)?;

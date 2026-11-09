@@ -264,6 +264,24 @@ impl SignalStore for SqliteSignalStore {
         Ok(())
     }
 
+    fn remove_session(&self, id: &str) -> Result<()> {
+        let key = format!("session-{id}");
+        if let Some(ext) = self.extension() {
+            // `keys.set({ session: { [id]: null } })` do Node — remove do
+            // backend e cai no SQLite só se o backend permitir fallback.
+            if ext.remove("session", id) {
+                return Ok(());
+            }
+            if !ext.sqlite_fallback() {
+                return Err(Self::backend_err("remoção", "session", id, "remove recusado"));
+            }
+            self.sqlite.remove(&key).map_err(Self::sqlite_err)?;
+            return Ok(());
+        }
+        self.sqlite.remove(&key).map_err(Self::sqlite_err)?;
+        Ok(())
+    }
+
     fn load_pre_key(&self, id: u32) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let key = format!("pre-key-{id}");
         if let Some(ext) = self.extension() {

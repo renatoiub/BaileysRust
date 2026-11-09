@@ -2769,11 +2769,59 @@ impl Client {
                         let msg = match inner {
                             Some(inner) => {
                                 let mut inner = *inner;
-                                if let Some(mut merged) = decoded.message_context_info.clone() {
+                                // Paridade Node `{ ...outer, ...inner }` — o inner
+                                // vence campo a campo (substituição, não merge
+                                // recursivo), preservando o `messageSecret` interno
+                                // das mensagens enviadas pelo celular.
+                                if let Some(mut outer) = decoded.message_context_info {
                                     if let Some(inner_ctx) = inner.message_context_info.take() {
-                                        let _ = merged.merge(inner_ctx.encode_to_vec().as_slice());
+                                        if inner_ctx.message_secret.is_some() {
+                                            outer.message_secret = inner_ctx.message_secret;
+                                        }
+                                        if inner_ctx.device_list_metadata.is_some() {
+                                            outer.device_list_metadata = inner_ctx.device_list_metadata;
+                                        }
+                                        if inner_ctx.device_list_metadata_version.is_some() {
+                                            outer.device_list_metadata_version =
+                                                inner_ctx.device_list_metadata_version;
+                                        }
+                                        if inner_ctx.padding_bytes.is_some() {
+                                            outer.padding_bytes = inner_ctx.padding_bytes;
+                                        }
+                                        if inner_ctx.message_add_on_duration_in_secs.is_some() {
+                                            outer.message_add_on_duration_in_secs =
+                                                inner_ctx.message_add_on_duration_in_secs;
+                                        }
+                                        if inner_ctx.bot_message_secret.is_some() {
+                                            outer.bot_message_secret = inner_ctx.bot_message_secret;
+                                        }
+                                        if inner_ctx.bot_metadata.is_some() {
+                                            outer.bot_metadata = inner_ctx.bot_metadata;
+                                        }
+                                        if inner_ctx.reporting_token_version.is_some() {
+                                            outer.reporting_token_version = inner_ctx.reporting_token_version;
+                                        }
+                                        if inner_ctx.message_add_on_expiry_type.is_some() {
+                                            outer.message_add_on_expiry_type =
+                                                inner_ctx.message_add_on_expiry_type;
+                                        }
+                                        if inner_ctx.message_association.is_some() {
+                                            outer.message_association = inner_ctx.message_association;
+                                        }
+                                        if inner_ctx.capi_created_group.is_some() {
+                                            outer.capi_created_group = inner_ctx.capi_created_group;
+                                        }
+                                        if inner_ctx.support_payload.is_some() {
+                                            outer.support_payload = inner_ctx.support_payload;
+                                        }
+                                        if inner_ctx.limit_sharing.is_some() {
+                                            outer.limit_sharing = inner_ctx.limit_sharing;
+                                        }
+                                        if inner_ctx.limit_sharing_v2.is_some() {
+                                            outer.limit_sharing_v2 = inner_ctx.limit_sharing_v2;
+                                        }
                                     }
-                                    inner.message_context_info = Some(merged);
+                                    inner.message_context_info = Some(outer);
                                 }
                                 inner
                             }
@@ -2800,6 +2848,21 @@ impl Client {
                     }
                     Err(err) => {
                         tracing::error!(error = %err, e2e_type = %e2e_type, "failed to decrypt message");
+                        // Auto-repair 1:1: multi-device do mesmo número compartilha
+                        // a mesma sessão de ratchet por peer. Quando o device irmão
+                        // avança o ratchet, este companion passa a falhar com
+                        // `bad MAC` / `invalid pre-key ID` / `no session record`.
+                        // Apagar a sessão faz a próxima mensagem vir como `pkmsg`
+                        // (pre-key) e re-negocia — em vez de loop de `msg` quebrado.
+                        if self.config.session_autorepair && (e2e_type == "msg" || e2e_type == "pkmsg") {
+                            let peer = if is_jid_user(sender) { sender } else { author };
+                            let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
+                            if let Err(e) = repo.remove_session(peer) {
+                                tracing::warn!(peer, error = %e, "autorepair: falha ao remover sessão 1:1");
+                            } else {
+                                tracing::info!(peer, e2e_type, "autorepair: sessão 1:1 removida para re-negociação");
+                            }
+                        }
                         info.message_stub_type = Some(wa::web_message_info::StubType::Ciphertext as i32);
                         info.message_stub_parameters = vec![err];
                     }
@@ -5376,6 +5439,20 @@ impl Client {
             ));
         }
 
+        // Identidade device-aware para a SenderKey do grupo. O receptor deriva o
+        // `author` de mensagens do próprio device como `{me_lid_user}:{device}@lid`
+        // (`decode_message_node` → `lid_author`), então a cifragem precisa usar a
+        // MESMA identidade. Sem isso, companion devices do mesmo número colidem
+        // sob `{grupo}::{lid}::0` e sobrescrevem a SenderKey uns dos outros
+        // (desync em cadeia: `skmsg over 2000 future`, chuva de retry).
+        let me_device = jid_device(&me_id).unwrap_or(0);
+        let me_lid_device = if me_device != 0 {
+            let user = jid_user(&me_lid).unwrap_or_default();
+            format!("{user}:{me_device}@lid")
+        } else {
+            me_lid.clone()
+        };
+
         let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
 
         // Metadados do grupo (participantes) — o retry com participant NÃO faz
@@ -5391,9 +5468,11 @@ impl Client {
 
         if let Some(participant) = participant {
             // Node: encryptGroupMessage({ group: destinationJid, data: bytes, meId: meLid }).
+            // Device-aware: usa `meLidDevice` (LID + device do companion) para a
+            // SenderKey bater com o `author` que os receptores derivam.
             let enc = repo.encrypt_group_message(
                 jid,
-                &me_lid,
+                &me_lid_device,
                 &write_random_pad_max16(&patched.encode_to_vec()),
             )?;
             let message_to_send = {
@@ -5441,9 +5520,10 @@ impl Client {
         }
 
         // Node: encryptGroupMessage({ group: destinationJid, data: bytes, meId: meLid }).
+        // Device-aware: mesma identidade `{lid}:{device}` usada no retry acima.
         let enc = repo.encrypt_group_message(
             jid,
-            &me_lid,
+            &me_lid_device,
             &write_random_pad_max16(&patched.encode_to_vec()),
         )?;
 

@@ -424,6 +424,12 @@ pub struct ClientConfig {
     pub cache_provider: Option<std::sync::Arc<dyn crate::cache::CacheStore>>,
     /// Prefixo dos caches por conexão no provider (`cache:instance:{key}:*`).
     pub cache_instance_key: Option<String>,
+    /// Auto-repair de sessão 1:1: apaga a sessão do peer quando a decriptação
+    /// falha com `bad MAC` / `invalid pre-key ID` / `no session record`, para
+    /// que a próxima mensagem re-negocie via pre-key (`pkmsg`) em vez de
+    /// entrar em loop de `msg` com sessão desalinhada (multi-device do mesmo
+    /// número compartilha a mesma sessão de ratchet por peer).
+    pub session_autorepair: bool,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -438,6 +444,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("cache_control", &self.cache_control)
             .field("cache_provider", &self.cache_provider.is_some())
             .field("cache_instance_key", &self.cache_instance_key)
+            .field("session_autorepair", &self.session_autorepair)
             .finish_non_exhaustive()
     }
 }
@@ -458,6 +465,7 @@ impl Default for ClientConfig {
             cache_control: true,
             cache_provider: None,
             cache_instance_key: None,
+            session_autorepair: true,
         }
     }
 }
