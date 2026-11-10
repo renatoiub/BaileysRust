@@ -535,6 +535,10 @@ pub struct Client {
     /// históricas quando o container (re)conecta e o peer pede retry em massa.
     /// Chave = JID do grupo (ou remoto 1:1), valor = nº de reenvios na janela.
     retry_cooldown: TtlCache<u32>,
+    /// Cooldown de auto-repair por peer — evita `remove_session` em rajada
+    /// para o mesmo device irmão (ex.: `:25`) numa janela curta. Chave = peer,
+    /// valor = nº de reparos na janela.
+    peer_repair_cooldown: TtlCache<u32>,
     /// `placeholderResendCache` — evita PDOs duplicados para o mesmo msg id.
     placeholder_resend_cache: TtlCache<()>,
     /// `lidCache` — mapeia `@s.whatsapp.net` → `@lid` (evita USync repetido).
@@ -602,8 +606,12 @@ impl Client {
             qr_close: Arc::new(tokio::sync::Notify::new()),
             force_session_cache: TtlCache::new(Duration::from_secs(600), 2000),
             retry_mutex: Mutex::new(()),
-            msg_retry_cache: TtlCache::new(Duration::from_secs(3600), 2000).with_flush_tracking(),
+            // TTL 24h: o backend Redis grava o TTL junto com o contador. Com
+            // 1h, o contador de retry por mensagem reseta e o loop de retry
+            // volta a reenviar a mesma mensagem histórica após o restart.
+            msg_retry_cache: TtlCache::new(Duration::from_secs(86400), 2000).with_flush_tracking(),
             retry_cooldown: TtlCache::new(Duration::from_secs(60), 5000),
+            peer_repair_cooldown: TtlCache::new(Duration::from_secs(60), 5000),
             placeholder_resend_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
             pn_of_lid_cache: TtlCache::new(Duration::from_secs(3600), 2000),
@@ -2136,7 +2144,7 @@ impl Client {
             }
         }
 
-        self.decrypt_message_node(node, &mut info, &author, &sender);
+        self.decrypt_message_node(node, &mut info, &author, &sender, sink).await;
 
         let msg_id = info.key.as_ref().and_then(|k| k.id.clone()).unwrap_or_default();
         if info.message_stub_type == Some(wa::web_message_info::StubType::Ciphertext as i32) {
@@ -2168,7 +2176,11 @@ impl Client {
                     }
                 }
             } else {
-                self.send_message_ack(node, sink).await?;
+                // Ack COM error (nack): sem isso o servidor reentrega a
+                // mensagem no offline resume, e o device irmão reenvia a
+                // mesma mensagem com chave velha em loop a cada restart.
+                // Port do zapo `sendDecryptFailureAck` (UNHANDLED_ERROR=500).
+                self.send_message_ack_err(node, sink, Some("500")).await?;
                 let client = self.clone();
                 let sink = sink.clone();
                 let retry_node = node.clone();
@@ -2277,7 +2289,7 @@ impl Client {
         };
         let DecodedMessageNode { full: mut info, author, sender, key_extras, .. } = decoded;
 
-        self.decrypt_message_node(node, &mut info, &author, &sender);
+        self.decrypt_message_node(node, &mut info, &author, &sender, sink).await;
 
         // `cleanMessage` + `upsertMessage` (→ `processMessage`).
         clean_message(&mut info, &self.me_id());
@@ -2711,12 +2723,13 @@ impl Client {
     }
 
     /// `decryptMessageNode().decrypt()` (Hineken `decode-wa-message.ts`).
-    fn decrypt_message_node(
-        &self,
+    async fn decrypt_message_node(
+        self: &Arc<Self>,
         stanza: &BinaryNode,
         info: &mut wa::WebMessageInfo,
         author: &str,
         sender: &str,
+        sink: &WsSink,
     ) {
         let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
         let mut decryptables = 0usize;
@@ -2887,11 +2900,34 @@ impl Client {
                         // (pre-key) e re-negocia — em vez de loop de `msg` quebrado.
                         if self.config.session_autorepair && (e2e_type == "msg" || e2e_type == "pkmsg") {
                             let peer = if is_jid_user(sender) { sender } else { author };
+                            // Cooldown por peer: sob enchente do mesmo device
+                            // irmão, repara a sessão no máximo 1x por janela
+                            // (evita rajada de `remove_session` + `<iq encrypt>`).
+                            const PEER_REPAIR_MAX_PER_WINDOW: u32 = 1;
+                            let mut repairs = self.peer_repair_cooldown.get(peer).await.unwrap_or(0);
+                            if repairs >= PEER_REPAIR_MAX_PER_WINDOW {
+                                tracing::debug!(peer, repairs, "autorepair: sessão 1:1 já reparada nesta janela, pulando");
+                                info.message_stub_type = Some(wa::web_message_info::StubType::Ciphertext as i32);
+                                info.message_stub_parameters = vec![err];
+                                continue;
+                            }
+                            repairs += 1;
+                            self.peer_repair_cooldown.set(peer.to_string(), repairs).await;
                             let repo = SignalRepository::new(self.store.as_ref() as &dyn SignalStore);
                             if let Err(e) = repo.remove_session(peer) {
                                 tracing::warn!(peer, error = %e, "autorepair: falha ao remover sessão 1:1");
                             } else {
                                 tracing::info!(peer, e2e_type, "autorepair: sessão 1:1 removida para re-negociação");
+                                // Port do zapo `syncSignalSession(force)`: após
+                                // remover, busca a chave nova imediatamente
+                                // (em vez de só esperar o próximo pkmsg).
+                                let lids = self.node_get_lid(peer, sink).await.ok();
+                                if let Err(e) = self
+                                    .assert_sessions(&[peer.to_string()], true, lids.as_deref(), sink)
+                                    .await
+                                {
+                                    tracing::warn!(peer, error = %e, "autorepair: assert_sessions(force) falhou");
+                                }
                             }
                         }
                         info.message_stub_type = Some(wa::web_message_info::StubType::Ciphertext as i32);
@@ -3521,6 +3557,20 @@ impl Client {
         node: &BinaryNode,
         sink: &WsSink,
     ) -> Result<(), ClientError> {
+        self.send_message_ack_err(node, sink, None).await
+    }
+
+    /// Ack com `error` opcional (nack). Sem `error`, o servidor reentrega a
+    /// mensagem no offline resume se o nó não foi consumido; com `error`
+    /// (ex.: `500` = UNHANDLED_ERROR, como o zapo) a mensagem é considerada
+    /// rejeitada e NÃO volta no reconnect — quebra o loop de `bad MAC` /
+    /// `no session record` dos devices irmãos após o restart.
+    async fn send_message_ack_err(
+        &self,
+        node: &BinaryNode,
+        sink: &WsSink,
+        error: Option<&str>,
+    ) -> Result<(), ClientError> {
         let mut ack = BinaryNode::new("ack")
             .with_attr("id", node.attr("id").unwrap_or_default())
             .with_attr("to", node.attr("from").unwrap_or_default())
@@ -3530,6 +3580,9 @@ impl Client {
         }
         if let Some(recipient) = node.attr("recipient") {
             ack = ack.with_attr("recipient", recipient);
+        }
+        if let Some(e) = error {
+            ack = ack.with_attr("error", e);
         }
         // Hineken: `!!attrs.type && (tag !== 'message' || unavailable ||
         // errorCode !== 0)` — sem `errorCode` (undefined) a condição é sempre
