@@ -2921,7 +2921,7 @@ impl Client {
                                 // Port do zapo `syncSignalSession(force)`: após
                                 // remover, busca a chave nova imediatamente
                                 // (em vez de só esperar o próximo pkmsg).
-                                let lids = self.node_get_lid(peer, sink).await.ok();
+                                let lids = self.node_get_lid(peer, sink).await.ok().flatten();
                                 if let Err(e) = self
                                     .assert_sessions(&[peer.to_string()], true, lids.as_deref(), sink)
                                     .await
