@@ -4945,8 +4945,9 @@ impl Client {
 
         // 1. Media connection — teto de 5s (a query trava quando a conexão
         // caiu silenciosamente; sem isso o cliente esperaria os 40s do
-        // `default_query_timeout_ms`). No timeout: fecha o socket para forçar
-        // reconexão imediata e devolve `MediaUploadTimeout` → "falha no upload".
+        // `default_query_timeout_ms`). No timeout devolve
+        // `MediaUploadTimeout` → "falha no upload" SEM derrubar o socket:
+        // a reconexão fica por conta do keepalive/read loop natural.
         let query = BinaryNode::new("iq")
             .with_attr("type", "set")
             .with_attr("xmlns", "w:m")
@@ -4960,10 +4961,7 @@ impl Client {
         .await
         {
             Ok(res) => res?,
-            Err(_) => {
-                self.force_reconnect().await;
-                return Err(ClientError::MediaUploadTimeout);
-            }
+            Err(_) => return Err(ClientError::MediaUploadTimeout),
         };
         let conn = result.child("media_conn").ok_or(ClientError::MediaConn)?;
         let auth = conn.attr("auth").unwrap_or_default().to_string();
@@ -5070,10 +5068,7 @@ impl Client {
         .await
         {
             Ok(res) => res?,
-            Err(_) => {
-                self.force_reconnect().await;
-                return Err(ClientError::MediaUploadTimeout);
-            }
+            Err(_) => return Err(ClientError::MediaUploadTimeout),
         };
         let conn = result.child("media_conn").ok_or(ClientError::MediaConn)?;
         let auth = conn.attr("auth").unwrap_or_default().to_string();
