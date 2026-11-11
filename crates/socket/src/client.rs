@@ -313,7 +313,8 @@ fn call_status_from_node(node: &BinaryNode) -> &'static str {
 const NO_MESSAGE_FOUND_ERROR_TEXT: &str = "Message absent from node";
 
 /// Teto de 5s para a query `media_conn` (obter chaves de upload). Acima disso
-/// o socket provavelmente caiu de forma silenciosa; abortamos e reconectamos.
+/// a query trava (conexão silenciosamente caída); no timeout, reutilizamos o
+/// cache anterior (`auth_ttl` = 6h) em vez de falhar o upload.
 const MEDIA_CONN_TIMEOUT_SECS: u64 = 5;
 
 /// Retorno do `decodeMessageNode`: `fullMessage` (key crua), `author`,
@@ -499,6 +500,27 @@ pub type LoadMessageFn = Arc<
 /// `patchMessageBeforeSending` do `SocketConfig` (default: identidade).
 pub type PatchMessageFn = Arc<dyn Fn(wa::Message) -> wa::Message + Send + Sync>;
 
+/// Cache da `media_conn` (auth + hosts + TTLs) — port do `refreshMediaConn`
+/// do Hineken. O token de auth vale `auth_ttl` (o WhatsApp devolve 21600s =
+/// 6h); o `ttl` (300s = 5 min) expira só a rota/hosts. Reutilizar o auth
+/// evita refazer a query a cada 5 min e o cascata de timeout de 5s em carga.
+#[derive(Debug, Clone)]
+struct CachedMediaConn {
+    auth: String,
+    hosts: Vec<(String, u64)>,
+    ttl: u64,
+    auth_ttl: Option<u64>,
+    fetched_at: std::time::Instant,
+}
+
+impl CachedMediaConn {
+    /// Expirou pelo prazo efetivo: `auth_ttl` (se o WA mandar) ou `ttl`.
+    fn is_expired(&self) -> bool {
+        let effective = self.auth_ttl.unwrap_or(self.ttl);
+        self.fetched_at.elapsed() >= std::time::Duration::from_secs(effective)
+    }
+}
+
 /// Cliente do socket WhatsApp.
 pub struct Client {
     store: Arc<SqliteSignalStore>,
@@ -573,6 +595,9 @@ pub struct Client {
     send_active_receipts: std::sync::atomic::AtomicBool,
     /// Cache do `fetchPrivacySettings`.
     privacy_settings: Mutex<Option<HashMap<String, String>>>,
+    /// Cache da `media_conn` (auth + hosts). Reutilizado enquanto o auth
+    /// estiver válido (`auth_ttl`), mesmo que a rota (`ttl`) expire.
+    media_conn_cache: tokio::sync::Mutex<Option<CachedMediaConn>>,
     /// `pendingAppStateSync` do `upsertMessage` (history sync sem `myAppStateKeyId`).
     pending_app_state_sync: std::sync::atomic::AtomicBool,
     /// Serializa o `resyncAppState` (o Node roda dentro de `keys.transaction`).
@@ -629,6 +654,7 @@ impl Client {
             patch_message_fn: std::sync::Mutex::new(None),
             send_active_receipts: std::sync::atomic::AtomicBool::new(false),
             privacy_settings: Mutex::new(None),
+            media_conn_cache: tokio::sync::Mutex::new(None),
             pending_app_state_sync: std::sync::atomic::AtomicBool::new(false),
             app_state_mutex: Mutex::new(()),
         };
@@ -4930,24 +4956,20 @@ impl Client {
 
     // --- envio de mídia ---
 
-    /// Faz o upload de um arquivo de mídia e retorna as chaves + URL.
-    ///
-    /// Port de `waUploadToServer` (`getWAUploadToServer`): busca a `media_conn`
-    /// (`<iq xmlns="w:m"><media_conn/>`), criptografa com AES-256-CBC e faz
-    /// POST em `https://{host}{path}/{sha256b64}?auth=...&token=...`.
-    pub async fn upload_media(
-        &self,
-        plaintext: &[u8],
-        media_type: baileys_media::MediaType,
-        sink: &WsSink,
-    ) -> Result<MediaUpload, ClientError> {
-        use rand::RngCore;
+    /// Busca a `media_conn` (`<iq xmlns="w:m"><media_conn/>`), reutilizando o
+    /// cache enquanto o `auth_ttl` não expirar. Se a query estourar os 5s e
+    /// houver cache anterior, REUTILIZA o cache (o auth continua válido por
+    /// `auth_ttl` = 6h) em vez de falhar o upload.
+    async fn fetch_media_conn(&self, sink: &WsSink) -> Result<CachedMediaConn, ClientError> {
+        {
+            let guard = self.media_conn_cache.lock().await;
+            if let Some(cached) = &*guard {
+                if !cached.is_expired() {
+                    return Ok(cached.clone());
+                }
+            }
+        }
 
-        // 1. Media connection — teto de 5s (a query trava quando a conexão
-        // caiu silenciosamente; sem isso o cliente esperaria os 40s do
-        // `default_query_timeout_ms`). No timeout devolve
-        // `MediaUploadTimeout` → "falha no upload" SEM derrubar o socket:
-        // a reconexão fica por conta do keepalive/read loop natural.
         let query = BinaryNode::new("iq")
             .with_attr("type", "set")
             .with_attr("xmlns", "w:m")
@@ -4961,7 +4983,16 @@ impl Client {
         .await
         {
             Ok(res) => res?,
-            Err(_) => return Err(ClientError::MediaUploadTimeout),
+            Err(_) => {
+                // Timeout da media_conn (> 5s): se houver cache anterior,
+                // reutiliza (auth ainda válido). Só falha se não houver nada.
+                let guard = self.media_conn_cache.lock().await;
+                if let Some(cached) = &*guard {
+                    tracing::warn!("media_conn timeout — reutilizando cache (auth_ttl ainda válido)");
+                    return Ok(cached.clone());
+                }
+                return Err(ClientError::MediaUploadTimeout);
+            }
         };
         let conn = result.child("media_conn").ok_or(ClientError::MediaConn)?;
         let auth = conn.attr("auth").unwrap_or_default().to_string();
@@ -4978,6 +5009,37 @@ impl Client {
         if hosts.is_empty() {
             return Err(ClientError::MediaConn);
         }
+        let ttl = conn.attr("ttl").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let auth_ttl = conn.attr("auth_ttl").and_then(|v| v.parse().ok());
+        let cached = CachedMediaConn {
+            auth,
+            hosts,
+            ttl,
+            auth_ttl,
+            fetched_at: std::time::Instant::now(),
+        };
+        *self.media_conn_cache.lock().await = Some(cached.clone());
+        tracing::debug!(ttl, auth_ttl = ?cached.auth_ttl, hosts = cached.hosts.len(), "media_conn renovada");
+        Ok(cached)
+    }
+
+    /// Faz o upload de um arquivo de mídia e retorna as chaves + URL.
+    ///
+    /// Port de `waUploadToServer` (`getWAUploadToServer`): busca a `media_conn`
+    /// (`<iq xmlns="w:m"><media_conn/>`), criptografa com AES-256-CBC e faz
+    /// POST em `https://{host}{path}/{sha256b64}?auth=...&token=...`.
+    pub async fn upload_media(
+        &self,
+        plaintext: &[u8],
+        media_type: baileys_media::MediaType,
+        sink: &WsSink,
+    ) -> Result<MediaUpload, ClientError> {
+        use rand::RngCore;
+
+        // 1. Media connection — cache por `auth_ttl` (6h) + reuso no timeout.
+        let cached = self.fetch_media_conn(sink).await?;
+        let auth = cached.auth;
+        let hosts = cached.hosts;
 
         // 2. Criptografa (AES-256-CBC + HMAC) como `encryptedStream`.
         let mut media_key = [0u8; 32];
@@ -5055,27 +5117,12 @@ impl Client {
         server_thumb_gen: bool,
         sink: &WsSink,
     ) -> Result<PlainUpload, ClientError> {
-        let query = BinaryNode::new("iq")
-            .with_attr("type", "set")
-            .with_attr("xmlns", "w:m")
-            .with_attr("to", S_WHATSAPP_NET)
-            .with_attr("id", self.next_tag())
-            .with_children(vec![BinaryNode::new("media_conn")]);
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_secs(MEDIA_CONN_TIMEOUT_SECS),
-            self.query_node(query, sink),
-        )
-        .await
-        {
-            Ok(res) => res?,
-            Err(_) => return Err(ClientError::MediaUploadTimeout),
-        };
-        let conn = result.child("media_conn").ok_or(ClientError::MediaConn)?;
-        let auth = conn.attr("auth").unwrap_or_default().to_string();
-        let hosts: Vec<String> = conn
-            .children("host")
+        let cached = self.fetch_media_conn(sink).await?;
+        let auth = cached.auth;
+        let hosts: Vec<String> = cached
+            .hosts
             .iter()
-            .map(|h| h.attr("hostname").unwrap_or_default().to_string())
+            .map(|(hostname, _)| hostname.clone())
             .filter(|h| !h.is_empty())
             .collect();
         if hosts.is_empty() {
