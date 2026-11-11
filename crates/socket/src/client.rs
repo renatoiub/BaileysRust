@@ -312,6 +312,10 @@ fn call_status_from_node(node: &BinaryNode) -> &'static str {
 /// `NO_MESSAGE_FOUND_ERROR_TEXT` do Hineken.
 const NO_MESSAGE_FOUND_ERROR_TEXT: &str = "Message absent from node";
 
+/// Teto de 5s para a query `media_conn` (obter chaves de upload). Acima disso
+/// o socket provavelmente caiu de forma silenciosa; abortamos e reconectamos.
+const MEDIA_CONN_TIMEOUT_SECS: u64 = 5;
+
 /// Retorno do `decodeMessageNode`: `fullMessage` (key crua), `author`,
 /// `sender` (`author` em chat 1:1, `chatId` nos demais) e `category`.
 struct DecodedMessageNode {
@@ -708,6 +712,20 @@ impl Client {
     /// `run` ainda não conectou.
     pub async fn sink(&self) -> Option<WsSink> {
         self.sink.lock().await.clone()
+    }
+
+    /// Força a queda do socket atual (reconexão via `connection update`).
+    ///
+    /// Fecha o sink ativo e acorda o loop de leitura (`qr_close`), fazendo
+    /// `run` sair e emitir `ConnectionUpdate { connection: "close" }`. O
+    /// container então reconecta sozinho (mesma regra de um erro 428/queda),
+    /// sem apagar creds, keys nem reler QR.
+    pub async fn force_reconnect(&self) {
+        if let Some(sink) = self.sink.lock().await.take() {
+            let _ = sink.lock().await.close().await;
+        }
+        self.qr_close.notify_waiters();
+        tracing::warn!("force_reconnect: socket fechado para reconexão imediata");
     }
 
     /// JID do `me` (normalizado) — vazio se ainda não pareou.
@@ -4422,12 +4440,21 @@ impl Client {
         let mut msg = wa::Message::decode(cached_bytes.as_slice()).unwrap_or_default();
         msg.message_context_info = None;
 
-        // `retryNode.attrs.count` (Node `messages-recv.js:711`).
-        let retry_count = node
+        // Fix do loop de retry (paridade `messages-recv.ts` do Hineken, commit
+        // `ee6e809`): o `count` do reenvio é SEMPRE 1. Antes era
+        // `+(retryNode.attrs.count || 1)` e o WhatsApp devolvia um `count`
+        // maior a cada retry, escalando em loop infinito e quebrando a sessão.
+        let _incoming_retry_count = node
             .child("retry")
             .and_then(|r| r.attr("count"))
             .and_then(|c| c.parse::<u32>().ok())
             .unwrap_or(1);
+        tracing::debug!(
+            incoming_retry_count = _incoming_retry_count,
+            msg_id,
+            remote,
+            "resend_retry: fixando count=1 (anti-loop)"
+        );
 
         // Node `handleReceipt`: `msgRelayOpts = { messageId: key.id, isretry: true }`
         // e, SÓ se `retryParticipantJid` existir, `msgRelayOpts.participant =
@@ -4447,7 +4474,7 @@ impl Client {
             Some(retry_participant_jid) => {
                 let relay_participant = RelayParticipant {
                     jid: retry_participant_jid.to_string(),
-                    count: retry_count.max(1),
+                    count: 1, // Fix anti-loop: nunca propaga o count do receipt
                 };
                 if baileys_core::is_jid_group(&target_jid) {
                     self.relay_group_message_retry(
@@ -4916,14 +4943,28 @@ impl Client {
     ) -> Result<MediaUpload, ClientError> {
         use rand::RngCore;
 
-        // 1. Media connection.
+        // 1. Media connection — teto de 5s (a query trava quando a conexão
+        // caiu silenciosamente; sem isso o cliente esperaria os 40s do
+        // `default_query_timeout_ms`). No timeout: fecha o socket para forçar
+        // reconexão imediata e devolve `MediaUploadTimeout` → "falha no upload".
         let query = BinaryNode::new("iq")
             .with_attr("type", "set")
             .with_attr("xmlns", "w:m")
             .with_attr("to", S_WHATSAPP_NET)
             .with_attr("id", self.next_tag())
             .with_children(vec![BinaryNode::new("media_conn")]);
-        let result = self.query_node(query, sink).await?;
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(MEDIA_CONN_TIMEOUT_SECS),
+            self.query_node(query, sink),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                self.force_reconnect().await;
+                return Err(ClientError::MediaUploadTimeout);
+            }
+        };
         let conn = result.child("media_conn").ok_or(ClientError::MediaConn)?;
         let auth = conn.attr("auth").unwrap_or_default().to_string();
         let hosts: Vec<(String, u64)> = conn
@@ -5022,7 +5063,18 @@ impl Client {
             .with_attr("to", S_WHATSAPP_NET)
             .with_attr("id", self.next_tag())
             .with_children(vec![BinaryNode::new("media_conn")]);
-        let result = self.query_node(query, sink).await?;
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(MEDIA_CONN_TIMEOUT_SECS),
+            self.query_node(query, sink),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                self.force_reconnect().await;
+                return Err(ClientError::MediaUploadTimeout);
+            }
+        };
         let conn = result.child("media_conn").ok_or(ClientError::MediaConn)?;
         let auth = conn.attr("auth").unwrap_or_default().to_string();
         let hosts: Vec<String> = conn
@@ -7144,6 +7196,8 @@ pub enum ClientError {
     GroupMetadata,
     #[error("media upload falhou em todos os hosts")]
     MediaUploadFailed,
+    #[error("tempo de resposta da media conn excedido (falha no upload)")]
+    MediaUploadTimeout,
     #[error("media: {0}")]
     Media(#[from] baileys_media::MediaError),
 }
